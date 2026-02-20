@@ -412,18 +412,26 @@ fn neatify_pairs(
     let mut drop_interline_pairs: Vec<(Vec<usize>, usize)> = Vec::new(); // (pair, shared_idx)
     let mut iterate_pairs: Vec<Vec<usize>> = Vec::new();
     let mut skeleton_pairs: Vec<Vec<usize>> = Vec::new();
+    let mut planar_from_np_clusters: Vec<usize> = Vec::new();
 
     for (_label, pair) in &pair_groups {
         if pair.len() != 2 {
             continue;
         }
 
-        // Skip non-planar pairs (either artifact is non-planar)
+        // Handle non-planar pairs (mirrors Python component-level bookkeeping)
         let np_count = pair.iter().filter(|&&i| non_planar.contains(&i)).count();
         if np_count > 0 {
-            // Non-planar cluster of 2: send to skeleton
             if np_count == 2 {
+                // Both non-planar: send to skeleton
                 skeleton_pairs.push(pair.clone());
+            } else {
+                // Mixed pair: collect planar member for singleton processing
+                for &idx in pair {
+                    if !non_planar.contains(&idx) {
+                        planar_from_np_clusters.push(idx);
+                    }
+                }
             }
             continue;
         }
@@ -524,13 +532,16 @@ fn neatify_pairs(
         }
     }
 
-    // Process drop_interline (dissolved) + iterate (first pass) as singletons
-    if !dissolved_indices.is_empty() || !iterate_pairs.is_empty() {
+    // Process drop_interline (dissolved) + iterate (first pass) + planar from
+    // mixed non-planar pairs as singletons
+    if !dissolved_indices.is_empty() || !iterate_pairs.is_empty() || !planar_from_np_clusters.is_empty() {
         let mut first_indices: Vec<usize> = dissolved_indices;
         // First pass of iterate pairs
         for pair in &iterate_pairs {
             first_indices.push(pair[0]);
         }
+        // Planar artifacts from mixed non-planar pairs
+        first_indices.extend(&planar_from_np_clusters);
         if !first_indices.is_empty() {
             neatify_singletons(network, &extended_geoms, &first_indices, params)?;
         }
@@ -725,9 +736,10 @@ fn process_nx_gx_identical(
 
     if all_within && !lines.is_empty() {
         // Check angle between two lines for sharp angle
+        // Use fixed 75° cutoff (not the COINS angle_threshold) to match Python behavior
         if lines.len() == 2 {
             let angle = geometry::angle_between_two_lines(&lines[0], &lines[1]);
-            if angle < params.angle_threshold {
+            if angle < 75.0 {
                 // Replace with direct connection between nodes
                 let direct = LineString::new(vec![
                     Coord { x: relevant_nodes[0][0], y: relevant_nodes[0][1] },
