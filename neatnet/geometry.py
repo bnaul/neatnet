@@ -8,6 +8,7 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import shapely
+import shapely.ops
 from libpysal import graph
 from scipy import spatial
 
@@ -15,7 +16,7 @@ from .nodes import consolidate_nodes
 
 
 def _is_within(
-    line: np.ndarray, poly: shapely.Polygon, rtol: float = 1e-4
+    line: np.ndarray, poly: shapely.Polygon | gpd.GeoSeries, rtol: float = 1e-4
 ) -> np.ndarray:
     """Check if the line is within a polygon with a set relative tolerance.
 
@@ -99,8 +100,8 @@ def angle_between_two_lines(
 
 def voronoi_skeleton(
     lines: list | np.ndarray | gpd.GeoSeries,
-    poly: None | shapely.Polygon = None,
-    snap_to: None | gpd.GeoSeries = None,
+    poly: None | shapely.Polygon | gpd.GeoSeries = None,
+    snap_to: None | bool | list | gpd.GeoSeries = None,
     max_segment_length: float | int = 1,
     buffer: None | float | int = None,
     secondary_snap_to: None | gpd.GeoSeries = None,
@@ -266,6 +267,7 @@ def voronoi_skeleton(
             # if we have some snapping targets, we need to figure out
             # what shall be snapped to what
             else:
+                assert not isinstance(snap_to, bool)
                 additions, splits = snap_to_targets(
                     edgelines, poly, snap_to, secondary_snap_to
                 )
@@ -316,9 +318,9 @@ def _consolidate(
 
 
 def snap_to_targets(
-    edgelines: np.ndarray,
-    poly: shapely.Polygon,
-    snap_to: gpd.GeoSeries,
+    edgelines: list | np.ndarray,
+    poly: shapely.Polygon | gpd.GeoSeries,
+    snap_to: list | gpd.GeoSeries,
     secondary_snap_to: None | gpd.GeoSeries = None,
 ) -> tuple[list[shapely.LineString], list[shapely.Point]]:
     """Snap edgelines to vertices.
@@ -392,24 +394,24 @@ def snap_to_targets(
 
 
 def _prep_components(
-    lines: np.ndarray | gpd.GeoSeries,
+    lines: list | np.ndarray | gpd.GeoSeries,
 ) -> tuple[pd.Series, pd.Series, gpd.GeoSeries]:
     """Helper for preparing graph components & labels in PySAL."""
 
     # cast edgelines to gdf
-    lines = gpd.GeoDataFrame(geometry=lines)
+    lines_gdf = gpd.GeoDataFrame(geometry=lines)
 
     # build queen contiguity on edgelines and extract component labels
-    not_empty = ~lines.is_empty
-    not_nan = ~lines.geometry.isna()
-    lines = lines[not_empty | not_nan]
-    comp_labels = graph.Graph.build_contiguity(lines, rook=False).component_labels
+    not_empty = ~lines_gdf.is_empty
+    not_nan = ~lines_gdf.geometry.isna()
+    lines_gdf = lines_gdf[not_empty | not_nan]
+    comp_labels = graph.Graph.build_contiguity(lines_gdf, rook=False).component_labels
 
     # compute size of each component
     comp_counts = comp_labels.value_counts()
 
     # get MultiLineString geometry per connected component
-    components = lines.dissolve(comp_labels)
+    components = lines_gdf.dissolve(comp_labels)
 
     return comp_labels, comp_counts, components
 

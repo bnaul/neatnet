@@ -35,7 +35,7 @@ DEBUGGING = False
 logger = logging.getLogger(__name__)
 
 
-def _check_input_crs(streets: gpd.GeoDataFrame, exclusion_mask: gpd.GeoSeries):
+def _check_input_crs(streets: gpd.GeoDataFrame, exclusion_mask: None | gpd.GeoSeries):
     """Ensure input data is in appropriate Coordinate reference systems."""
 
     streets_crs = streets.crs
@@ -309,7 +309,7 @@ def neatify_singletons(
 
     cleaned_streets = streets.drop(to_drop)
     # split lines on new nodes
-    cleaned_streets = split(split_points, streets.drop(to_drop), streets.crs)
+    cleaned_streets = split(split_points, streets.drop(to_drop), streets.crs)  # type: ignore[arg-type]
 
     if to_add:
         # Create new streets with fixed geometry.
@@ -338,7 +338,7 @@ def neatify_singletons(
         final = final.drop(
             columns=[c for c in streets.columns if c.startswith("coins_")]
         )
-    return final
+    return final  # type: ignore[return-value]
 
 
 def neatify_pairs(
@@ -446,7 +446,7 @@ def neatify_pairs(
 
         # Re-run node cleaning on subset of fresh street edges
         streets_cleaned = remove_interstitial_nodes(
-            _drop_streets,
+            _drop_streets,  # type: ignore[arg-type]
             aggfunc=agg,
         )
 
@@ -492,7 +492,7 @@ def neatify_pairs(
         # Merged pairs & first instance – w/o COINS
         streets_cleaned = neatify_singletons(
             pd.concat([merged_pairs, _1st]),
-            streets_cleaned,
+            streets_cleaned,  # type: ignore[arg-type]
             max_segment_length=max_segment_length,
             clip_limit=clip_limit,
             compute_coins=False,
@@ -503,7 +503,7 @@ def neatify_pairs(
         # Second instance – w/ COINS
         if not _2nd.empty:
             streets_cleaned = neatify_singletons(
-                _2nd,
+                _2nd,  # type: ignore[arg-type]
                 streets_cleaned,
                 max_segment_length=max_segment_length,
                 clip_limit=clip_limit,
@@ -516,15 +516,15 @@ def neatify_pairs(
     # Dispatch cluster simplifier
     if not for_skeleton.empty:
         streets_cleaned = neatify_clusters(
-            for_skeleton,
-            streets_cleaned,
+            for_skeleton,  # type: ignore[arg-type]
+            streets_cleaned,  # type: ignore[arg-type]
             max_segment_length=max_segment_length,
             simplification_factor=simplification_factor,
             min_dangle_length=min_dangle_length,
             consolidation_tolerance=consolidation_tolerance,
         )
 
-    return streets_cleaned
+    return streets_cleaned  # type: ignore[return-value]
 
 
 def neatify_clusters(
@@ -614,11 +614,11 @@ def neatify_clusters(
     for c in new_streets.columns.drop(new_streets.active_geometry_name):
         if c != "_status":
             agg[c] = "first"
-    new_streets = remove_interstitial_nodes(
+    new_streets = remove_interstitial_nodes(  # type: ignore[assignment]
         new_streets[~new_streets.is_empty], aggfunc=agg
     ).drop_duplicates("geometry")
 
-    return new_streets
+    return new_streets  # type: ignore[return-value]
 
 
 def get_type(edges: gpd.GeoDataFrame, shared_edge: int) -> str:
@@ -1030,7 +1030,7 @@ def neatify_loop(
     # Remove edges fully within the artifact (dangles).
     _, r_idx = streets.sindex.query(artifacts.geometry, predicate="contains")
     # Dropping may lead to new false nodes – drop those
-    streets = remove_interstitial_nodes(streets.drop(streets.index[r_idx]))
+    streets = remove_interstitial_nodes(streets.drop(streets.index[r_idx]))  # type: ignore[arg-type, assignment]
 
     # Filter singleton artifacts
     rook = graph.Graph.build_contiguity(artifacts, rook=True)
@@ -1079,7 +1079,7 @@ def neatify_loop(
         )
 
     if "coins_group" in streets.columns:
-        streets = streets.drop(
+        streets = streets.drop(  # type: ignore[assignment]
             columns=[c for c in streets.columns if c.startswith("coins_")]
         )
     return streets

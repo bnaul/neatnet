@@ -87,6 +87,8 @@ def geom_test(
     if not is_geopandas(collection2):
         collection2 = geopandas.GeoSeries(collection2)
 
+    assert isinstance(collection1, geopandas.GeoSeries)
+    assert isinstance(collection2, geopandas.GeoSeries)
     geoms1 = collection1.geometry.normalize()
     geoms2 = collection2.geometry.normalize()
 
