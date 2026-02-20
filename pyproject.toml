@@ -47,7 +47,7 @@ tests = [
     "codecov",
     "coverage",
     "matplotlib",
-    "mypy>=1.15.0,<2",
+    "ty",
     "pre-commit",
     "pyarrow>=17.0",
     "pytest",
@@ -110,6 +110,9 @@ filterwarnings = [
 markers = [
     'wuhan:Wuhan takes ages to run'
 ]
+[tool.ty.rules]
+unresolved-import = "ignore"
+
 [tool.pixi.workspace]
 channels = ["conda-forge"]
 platforms = ["linux-64", "osx-arm64", "osx-64", "win-64"]
@@ -128,7 +131,7 @@ pyarrow = "*"
 pyogrio = "*"
 scipy = "*"
 shapely = "*"
-mypy = ">=1.15.0,<2"
+ty = "*"
 pre-commit = "*"
 pytest = "*"
 pytest-cov = "*"
