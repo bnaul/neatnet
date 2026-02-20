@@ -5,6 +5,7 @@ import pytest
 import shapely
 
 import neatnet
+import neatnet.geometry
 
 
 class TestIsWithin:

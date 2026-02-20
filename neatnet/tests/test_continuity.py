@@ -7,6 +7,8 @@ import pytest
 import shapely
 
 import neatnet
+import neatnet.artifacts
+import neatnet.continuity
 
 
 @pytest.fixture
