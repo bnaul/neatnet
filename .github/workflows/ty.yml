@@ -1,5 +1,5 @@
 ---
-name: MyPy Type Checking
+name: ty Type Checking
 
 on:
   push:
@@ -17,25 +17,19 @@ on:
         required: false
 
 jobs:
-  mypy:
+  ty:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        shell: bash -l {0}
 
     steps:
       - uses: actions/checkout@v6
 
-      - name: setup micromamba
-        uses: mamba-org/setup-micromamba@v2
-        with:
-          environment-file: ci/py314_latest.yaml
-          create-args: >-
-            mypy
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
 
       - name: Install package
-        run: pip install .
+        run: |
+          uv venv
+          uv pip install . ty
 
       - name: Check package
-        run: |
-            mypy neatnet/ --ignore-missing-imports --install-types --non-interactive
+        run: uv run ty check neatnet/

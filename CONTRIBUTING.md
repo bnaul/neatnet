@@ -86,16 +86,10 @@ You can create a development environment using [Pixi](https://pixi.sh):
 pixi install -e tests
 ```
 
-Or with conda using the `environment.yml` file:
+Or install directly with pip:
 
 ```sh
-conda env create -f environment.yml
-```
-
-To install `neatnet` to the environment in an editable form, clone the repository, navigate to the main directory and install it with pip:
-
-```sh
-pip install -e .
+pip install -e ".[tests]"
 ```
 
 When submitting a pull request:

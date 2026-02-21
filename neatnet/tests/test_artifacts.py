@@ -43,6 +43,7 @@ def test_FaceArtifacts():  # noqa: N802
         fill_edge_geometry=True,
     )
     fa = neatnet.FaceArtifacts(gdf)
+    assert fa.threshold is not None
     assert 6 < fa.threshold < 9
     assert isinstance(fa.face_artifacts, geopandas.GeoDataFrame)
     assert fa.face_artifacts.shape[0] > 200
@@ -52,14 +53,17 @@ def test_FaceArtifacts():  # noqa: N802
         neatnet.FaceArtifacts(gdf.cx[712104:713000, 3961073:3961500])
 
     fa_ipq = neatnet.FaceArtifacts(gdf, index="isoperimetric_quotient")
+    assert fa_ipq.threshold is not None
     assert 6 < fa_ipq.threshold < 9
     assert fa_ipq.threshold != fa.threshold
 
     fa_dia = neatnet.FaceArtifacts(gdf, index="diameter_ratio")
+    assert fa_dia.threshold is not None
     assert 6 < fa_dia.threshold < 9
     assert fa_dia.threshold != fa.threshold
 
     fa = neatnet.FaceArtifacts(gdf, index="isoperimetric_quotient")
+    assert fa.threshold is not None
     assert 6 < fa.threshold < 9
 
     with pytest.raises(ValueError, match="'banana' is not supported"):

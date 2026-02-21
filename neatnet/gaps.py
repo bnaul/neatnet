@@ -3,6 +3,7 @@ import operator
 
 import geopandas as gpd
 import numpy as np
+import pandas as pd
 import shapely
 
 __all__ = [
@@ -70,11 +71,13 @@ def close_gaps(
 
     new_geom.name = gdf.active_geometry_name
 
-    return gdf.set_geometry(new_geom)
+    result = gdf.set_geometry(new_geom)
+    assert result is not None
+    return result
 
 
 def extend_lines(
-    gdf: gpd.GeoDataFrame,
+    gdf: gpd.GeoSeries | gpd.GeoDataFrame,
     tolerance: float,
     *,
     target: None | gpd.GeoSeries | gpd.GeoDataFrame = None,
@@ -230,12 +233,14 @@ def extend_lines(
     if isinstance(gdf, gpd.GeoSeries):
         return gs
 
-    return gdf.set_geometry(gs)
+    result = gdf.set_geometry(gs)
+    assert result is not None
+    return result
 
 
 def _extend_line(
     coords: np.ndarray,
-    target: gpd.GeoDataFrame | gpd.GeoSeries,
+    target: gpd.GeoDataFrame | gpd.GeoSeries | pd.Series | pd.DataFrame,
     tolerance: float,
     snap: bool = True,
 ) -> np.ndarray:

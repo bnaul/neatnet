@@ -9,13 +9,14 @@ import numpy as np
 import pandas as pd
 import pyproj
 import shapely
+import shapely.ops
 from packaging.version import Version
 from scipy import sparse
 from scipy.cluster import hierarchy
 from sklearn.cluster import DBSCAN
 
 
-def _fill_attrs(gdf: gpd.GeoDataFrame, source_row: pd.Series) -> gpd.GeoDataFrame:
+def _fill_attrs(gdf: gpd.GeoDataFrame | pd.DataFrame, source_row: pd.Series) -> gpd.GeoDataFrame | pd.DataFrame:
     """Thoughtful attribute assignment to lines split into segments by new nodes –
     taking list-like values into consideration. See gh#213. Regarding iterables,
     currently only supports list values – others can be added based on input type
@@ -52,7 +53,7 @@ def split(
     crs: str | pyproj.CRS,
     *,
     eps: float = 1e-4,
-) -> gpd.GeoSeries | gpd.GeoDataFrame:
+) -> gpd.GeoDataFrame:
     """Split lines on new nodes.
 
     Parameters
@@ -118,7 +119,7 @@ def split(
                     cleaned_streets, geometry="geometry", crs=crs
                 )
 
-    return cleaned_streets.reset_index(drop=True)
+    return cleaned_streets.reset_index(drop=True)  # type: ignore[return-value]
 
 
 def _snap_n_split(e: shapely.LineString, s: shapely.Point, tol: float) -> np.ndarray:
@@ -207,9 +208,9 @@ def isolate_bowtie_nodes(edgelines: list | np.ndarray | gpd.GeoSeries) -> gpd.Ge
                 if unique_sorted_edge_coords.shape[0] == 3:
                     ignore += potential_bowtie_cc
 
-    return gpd.GeoSeries([shapely.Point(i) for i in ignore]).sort_values(
-        ignore_index=True
-    )
+    return gpd.GeoSeries(  # type: ignore[return-value]
+        [shapely.Point(i) for i in ignore]
+    ).sort_values(ignore_index=True)
 
 
 def get_components(
@@ -377,6 +378,7 @@ def _identify_degree_mismatch(
     """Helper to identify difference of observed vs. expected node degree."""
     nodes = _nodes_degrees_from_edges(edges.geometry)
     nodes = nodes.set_crs(edges.crs)
+    assert nodes is not None
     nix, eix = edges.sindex.query(nodes.geometry, **sindex_kws)
     coo_vals = ([True] * len(nix), (nix, eix))
     coo_shape = (len(nodes), len(edges))
@@ -490,9 +492,9 @@ def remove_interstitial_nodes(
         return gdf
 
     if isinstance(gdf, gpd.GeoSeries):
-        gdf = gdf.to_frame("geometry")
+        gdf = gdf.to_frame("geometry")  # type: ignore[assignment]
 
-    gdf = gdf.explode(ignore_index=True)
+    gdf = gdf.explode(ignore_index=True)  # type: ignore[assignment]
 
     labels = get_components(gdf.geometry)
 
@@ -529,7 +531,7 @@ def remove_interstitial_nodes(
     # Derive nodes
     nodes = _nodes_from_edges(aggregated.geometry)
     # Bifurcate edges into loops and non-loops
-    loops, not_loops = _loops_and_non_loops(aggregated)
+    loops, not_loops = _loops_and_non_loops(aggregated)  # type: ignore[arg-type]
 
     # Ensure:
     #   - all loops have exactly 1 endpoint; and
@@ -546,7 +548,7 @@ def remove_interstitial_nodes(
             fixed_index.append(ix)
 
     aggregated.loc[loops.index[fixed_index], aggregated.geometry.name] = fixed_loops
-    return aggregated.reset_index(drop=True)
+    return aggregated.reset_index(drop=True)  # type: ignore[return-value]
 
 
 def _rotate_loop_coords(
@@ -628,7 +630,7 @@ def fix_topology(
     """
     streets = streets[~streets.geometry.normalize().duplicated()].copy()
     streets_w_nodes = induce_nodes(streets, eps=eps)
-    return remove_interstitial_nodes(streets_w_nodes, **kwargs)
+    return remove_interstitial_nodes(streets_w_nodes, **kwargs)  # type: ignore[return-value]
 
 
 def consolidate_nodes(
@@ -636,7 +638,7 @@ def consolidate_nodes(
     *,
     tolerance: float = 2.0,
     preserve_ends: bool = False,
-) -> gpd.GeoSeries:
+) -> gpd.GeoDataFrame:
     """Return geometry with consolidated nodes.
 
     Replace clusters of nodes with a single node (weighted centroid
@@ -771,7 +773,7 @@ def consolidate_nodes(
     for c in gdf.columns.drop(gdf.active_geometry_name):
         if c != "_status":
             agg[c] = "first"
-    return remove_interstitial_nodes(
+    return remove_interstitial_nodes(  # type: ignore[return-value]
         gdf[~gdf.geometry.is_empty].explode(),
         # NOTE: this aggfunc needs to be able to process all the columns
         aggfunc=agg,

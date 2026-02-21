@@ -322,6 +322,7 @@ def get_artifacts(
         warnings.filterwarnings("ignore", message="No threshold found")
         fas = FaceArtifacts(streets)
     polys = fas.polygons.set_crs(streets.crs)
+    assert polys is not None
 
     # rook neighbors
     rook = graph.Graph.build_contiguity(polys, rook=True)
@@ -671,7 +672,7 @@ def reconnect(
 
 def remove_dangles(
     new_connections: np.ndarray,
-    artifact: gpd.GeoDataFrame,
+    artifact: gpd.GeoDataFrame | pd.DataFrame,
     eps: float = 1e-4,
 ) -> np.ndarray:
     """Dropping lines can introduce dangling edges. Remove those.
@@ -718,7 +719,7 @@ def one_remaining(
     split_points: list,
     clip_limit: float | int,
     consolidation_tolerance: float | int,
-) -> gpd.GeoDataFrame:
+) -> np.ndarray:
     """Resolve situations where there is 1 highest hierarchy and 1
     remaining node. This function is called within ``artifacts.nx_gx()``:
         * first SUBRANCH of BRANCH 2:
@@ -790,14 +791,14 @@ def one_remaining(
 def multiple_remaining(
     edges: gpd.GeoDataFrame,
     es_mask: pd.Series,
-    artifact: pd.DataFrame,
+    artifact: gpd.GeoDataFrame | pd.DataFrame,
     max_segment_length: float | int,
     highest_hierarchy: gpd.GeoDataFrame,
     split_points: list,
     snap_to: gpd.GeoSeries,
     clip_limit: float | int,
     consolidation_tolerance: float | int,
-) -> gpd.GeoDataFrame:
+) -> np.ndarray:
     """Resolve situations where there is 1 highest hierarchy and multiple
     remaining nodes. This function is called within ``artifacts.nx_gx()``:
         * second SUBRANCH of BRANCH 2:
@@ -858,7 +859,7 @@ def multiple_remaining(
 def one_remaining_c(
     remaining_nodes: gpd.GeoDataFrame,
     highest_hierarchy: gpd.GeoDataFrame,
-    artifact: gpd.GeoDataFrame,
+    artifact: gpd.GeoDataFrame | pd.DataFrame,
     edges: gpd.GeoDataFrame,
     es_mask: pd.Series,
     max_segment_length: float | int,
@@ -1124,7 +1125,7 @@ def nx_gx_identical(
     geom: shapely.Polygon,
     to_drop: list,
     to_add: list,
-    nodes: gpd.GeoSeries,
+    nodes: gpd.GeoSeries | gpd.GeoDataFrame,
     angle: float | int,
     max_segment_length: float | int = 1,
     clip_limit: float | int = 2,
@@ -1220,7 +1221,7 @@ def nx_gx(
     to_drop: list,
     to_add: list,
     split_points: list,
-    nodes: gpd.GeoSeries,
+    nodes: gpd.GeoSeries | gpd.GeoDataFrame,
     max_segment_length: float | int = 1,
     clip_limit: float | int = 2,
     min_dangle_length: float | int = 10,
@@ -1277,7 +1278,7 @@ def nx_gx(
     """
 
     # ensure CRS is set - gh#219
-    nodes = nodes.set_crs(edges.crs)
+    nodes = nodes.set_crs(edges.crs)  # type: ignore[assignment]  # set_crs overload
 
     # filter ends
     all_ends = edges[edges.coins_end]

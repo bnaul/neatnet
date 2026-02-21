@@ -15,7 +15,7 @@ import neatnet
 # See gh#121
 neatnet.simplify.DEBUGGING = False
 
-line_collection = (  # type: ignore[valid-type, misc]
+line_collection = (
     list[shapely.LineString]
     | tuple[shapely.LineString]
     | numpy.ndarray
@@ -54,8 +54,8 @@ KNOWN_BAD_GEOMS = {
 
 
 def polygonize(
-    collection: line_collection,  # type: ignore[valid-type]
-    as_geom: bool = True,  # type: ignore[valid-type]
+    collection: line_collection,
+    as_geom: bool = True,
 ) -> shapely.Polygon | geopandas.GeoSeries:
     """Testing helper -- Create polygon from collection of lines."""
     if isinstance(collection, pandas.Series | geopandas.GeoSeries):
@@ -68,13 +68,13 @@ def polygonize(
         return shapely.polygonize(collection).buffer(0)
 
 
-def is_geopandas(collection: geometry_collection) -> bool:  # type: ignore[valid-type]
+def is_geopandas(collection: geometry_collection) -> bool:
     return isinstance(collection, geopandas.GeoSeries | geopandas.GeoDataFrame)
 
 
 def geom_test(
-    collection1: geometry_collection,  # type: ignore[valid-type]
-    collection2: geometry_collection,  # type: ignore[valid-type]
+    collection1: geometry_collection,
+    collection2: geometry_collection,
     tolerance: float = 1e-1,
     aoi: None | str = None,
     save_dir: pathlib.Path = pathlib.Path(""),
@@ -87,8 +87,10 @@ def geom_test(
     if not is_geopandas(collection2):
         collection2 = geopandas.GeoSeries(collection2)
 
-    geoms1 = collection1.geometry.normalize()  # type: ignore[attr-defined]
-    geoms2 = collection2.geometry.normalize()  # type: ignore[attr-defined]
+    assert isinstance(collection1, geopandas.GeoSeries)
+    assert isinstance(collection2, geopandas.GeoSeries)
+    geoms1 = collection1.geometry.normalize()
+    geoms2 = collection2.geometry.normalize()
 
     if aoi and aoi.startswith("apalachicola"):
         # Varied index order across OSs.
