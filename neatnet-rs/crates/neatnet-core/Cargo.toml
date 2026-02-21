@@ -22,5 +22,15 @@ ordered-float = { workspace = true }
 rayon = { workspace = true }
 hashbrown = { workspace = true }
 
+# Optional deps for CLI binary
+parquet = { workspace = true, optional = true }
+
+[features]
+cli = ["dep:parquet"]
+
+[[bin]]
+name = "profile_neatify"
+required-features = ["cli"]
+
 [dev-dependencies]
 approx = "0.5"
