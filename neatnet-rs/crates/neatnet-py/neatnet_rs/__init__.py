@@ -1,6 +1,8 @@
 """neatnet-rs: Rust-accelerated street network simplification."""
 
 import geopandas as gpd
+import pandas as pd
+import pyarrow as pa
 
 from neatnet_rs._neatnet_rs import (
     coins as _coins_arrow,
@@ -25,11 +27,17 @@ def neatify(streets: gpd.GeoDataFrame, **kwargs) -> gpd.GeoDataFrame:
     Returns
     -------
     GeoDataFrame
-        Simplified street network with geometry and status columns.
+        Simplified street network with geometry, status, and parent_ids columns.
+        parent_ids is a PyArrow-backed list<uint32> column for zero-copy performance.
     """
     table = streets.to_arrow(geometry_encoding="geoarrow")
-    result = _neatify_arrow(table, **kwargs)
-    return gpd.GeoDataFrame.from_arrow(result)
+    arrow_table = _neatify_arrow(table, **kwargs)
+    # Pull parent_ids out before GeoDataFrame.from_arrow() (which would
+    # materialize it as Python lists), then re-attach as ArrowDtype-backed.
+    parent_ids_col = arrow_table.column("parent_ids")
+    gdf = gpd.GeoDataFrame.from_arrow(arrow_table.drop("parent_ids"))
+    gdf["parent_ids"] = pd.arrays.ArrowExtensionArray(parent_ids_col.combine_chunks())
+    return gdf
 
 
 def coins(streets: gpd.GeoDataFrame, *, angle_threshold: float = 120.0) -> gpd.GeoDataFrame:

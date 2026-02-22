@@ -4,6 +4,7 @@
 //! `neatify_singletons`, `neatify_pairs`, `neatify_clusters`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::Instant;
 
 use geo::{Area, BooleanOps, BoundingRect, Buffer, Centroid, Contains, Distance, Euclidean, Intersects, Length, Relate, Simplify};
 use geo_types::{Coord, LineString, MultiPolygon, Point, Polygon};
@@ -35,24 +36,32 @@ pub fn neatify(
     exclusion_mask: Option<&[Polygon<f64>]>,
 ) -> Result<(), NeatifyError> {
     // Step 1: Fix topology
-    let (fixed_geoms, fixed_statuses) =
-        nodes::fix_topology(&network.geometries, &network.statuses, params.eps);
+    let t_step = Instant::now();
+    let (fixed_geoms, fixed_statuses, fixed_parents) =
+        nodes::fix_topology(&network.geometries, &network.statuses, &network.parent_ids, params.eps);
     network.geometries = fixed_geoms;
     network.statuses = fixed_statuses;
+    network.parent_ids = fixed_parents;
+    log::info!("[neatify] fix_topology: {:.3}s ({} edges)", t_step.elapsed().as_secs_f64(), network.geometries.len());
 
     // Step 2: Consolidate nodes (pass pre-built tree to avoid redundant build)
+    let t_step = Instant::now();
     let edge_tree = crate::spatial::build_rtree(&network.geometries);
-    let (consol_geoms, consol_statuses) = nodes::consolidate_nodes_with_tree(
+    let (consol_geoms, consol_statuses, consol_parents) = nodes::consolidate_nodes_with_tree(
         &network.geometries,
         &network.statuses,
+        &network.parent_ids,
         params.max_segment_length * 2.1,
         false,
         Some(&edge_tree),
     );
     network.geometries = consol_geoms;
     network.statuses = consol_statuses;
+    network.parent_ids = consol_parents;
+    log::info!("[neatify] consolidate_nodes: {:.3}s ({} edges)", t_step.elapsed().as_secs_f64(), network.geometries.len());
 
     // Step 3: Detect artifacts (with iterative expansion)
+    let t_step = Instant::now();
     let artifacts = artifacts::get_artifacts(
         &network.geometries,
         params.artifact_threshold,
@@ -72,6 +81,7 @@ pub fn neatify(
             return Ok(());
         }
     };
+    log::info!("[neatify] get_artifacts: {:.3}s ({} artifacts)", t_step.elapsed().as_secs_f64(), artifact_geoms.len());
 
     if artifact_geoms.is_empty() {
         log::warn!("No artifacts found. Returning after topology fixes.");
@@ -81,17 +91,23 @@ pub fn neatify(
     // Step 4: Iterative simplification loops
     let mut current_artifacts = artifact_geoms;
     for loop_idx in 0..params.n_loops {
+        let t_loop = Instant::now();
         neatify_loop(network, &current_artifacts, params)?;
+        log::info!("[neatify] loop {}: neatify_loop {:.3}s", loop_idx, t_loop.elapsed().as_secs_f64());
 
         // Post-loop cleanup: induce nodes + dedup (matches Python)
-        let (induced_geoms, induced_statuses) =
-            nodes::induce_nodes(&network.geometries, &network.statuses, params.eps);
+        let t_step = Instant::now();
+        let (induced_geoms, induced_statuses, induced_parents) =
+            nodes::induce_nodes(&network.geometries, &network.statuses, &network.parent_ids, params.eps);
         network.geometries = induced_geoms;
         network.statuses = induced_statuses;
+        network.parent_ids = induced_parents;
         dedup_network(network);
+        log::info!("[neatify] loop {}: post-cleanup {:.3}s ({} edges)", loop_idx, t_step.elapsed().as_secs_f64(), network.geometries.len());
 
         // Re-detect artifacts for subsequent loops
         if loop_idx < params.n_loops - 1 {
+            let t_step = Instant::now();
             let re_artifacts = artifacts::get_artifacts(
                 &network.geometries,
                 Some(threshold),
@@ -103,6 +119,7 @@ pub fn neatify(
                 params.isoareal_threshold_circles_enclosed,
                 params.isoperimetric_threshold_circles_touching,
             );
+            log::info!("[neatify] loop {}: re-detect artifacts {:.3}s", loop_idx, t_step.elapsed().as_secs_f64());
             match re_artifacts {
                 Some((new_geoms, _new_fais, _new_threshold)) => {
                     current_artifacts = new_geoms;
@@ -117,14 +134,17 @@ pub fn neatify(
     // skeleton generation. Python's GEOS operations implicitly filter these.
     let mut clean_geoms = Vec::new();
     let mut clean_statuses = Vec::new();
-    for (geom, &status) in network.geometries.iter().zip(network.statuses.iter()) {
+    let mut clean_parents = Vec::new();
+    for ((geom, &status), parents) in network.geometries.iter().zip(network.statuses.iter()).zip(network.parent_ids.iter()) {
         if geom.0.len() >= 2 && Euclidean.length(geom) > params.eps {
             clean_geoms.push(geom.clone());
             clean_statuses.push(status);
+            clean_parents.push(parents.clone());
         }
     }
     network.geometries = clean_geoms;
     network.statuses = clean_statuses;
+    network.parent_ids = clean_parents;
 
     Ok(())
 }
@@ -138,6 +158,7 @@ fn neatify_loop(
     params: &NeatifyParams,
 ) -> Result<(), NeatifyError> {
     // 1. Remove dangles: drop edges fully inside any artifact, then clean
+    let t_step = Instant::now();
     let tree = crate::spatial::build_rtree(&network.geometries);
     let mut dangle_indices = HashSet::new();
     for artifact in artifact_geoms {
@@ -163,22 +184,28 @@ fn neatify_loop(
     if !dangle_indices.is_empty() {
         let mut new_geoms = Vec::new();
         let mut new_statuses = Vec::new();
+        let mut new_parents = Vec::new();
         for (i, geom) in network.geometries.iter().enumerate() {
             if !dangle_indices.contains(&i) {
                 new_geoms.push(geom.clone());
                 new_statuses.push(network.statuses[i]);
+                new_parents.push(network.parent_ids[i].clone());
             }
         }
         network.geometries = new_geoms;
         network.statuses = new_statuses;
+        network.parent_ids = new_parents;
     }
 
-    let (cleaned, statuses) =
-        nodes::remove_interstitial_nodes(&network.geometries, &network.statuses);
+    let (cleaned, statuses, cleaned_parents) =
+        nodes::remove_interstitial_nodes(&network.geometries, &network.statuses, &network.parent_ids);
     network.geometries = cleaned;
     network.statuses = statuses;
+    network.parent_ids = cleaned_parents;
+    log::info!("  [loop] remove_dangles + clean: {:.3}s (dropped {}, {} edges remain)", t_step.elapsed().as_secs_f64(), dangle_indices.len(), network.geometries.len());
 
     // 2. Build contiguity graph on artifacts → classify as singles/pairs/clusters
+    let t_step = Instant::now();
     let adjacency = artifacts::build_contiguity_graph(artifact_geoms, true);
     let comp_labels = artifacts::component_labels_from_adjacency(&adjacency);
 
@@ -201,20 +228,27 @@ fn neatify_loop(
             None => {}
         }
     }
+    log::info!("  [loop] classify: {:.3}s ({} singles, {} pairs, {} clusters)", t_step.elapsed().as_secs_f64(), singles.len(), pairs.len(), clusters.len());
 
     // 3. Simplify singletons
     if !singles.is_empty() {
+        let t_step = Instant::now();
         neatify_singletons(network, artifact_geoms, &singles, params, None)?;
+        log::info!("  [loop] neatify_singletons: {:.3}s", t_step.elapsed().as_secs_f64());
     }
 
     // 4. Simplify pairs
     if !pairs.is_empty() {
+        let t_step = Instant::now();
         neatify_pairs(network, artifact_geoms, &pairs, &comp_labels, params)?;
+        log::info!("  [loop] neatify_pairs: {:.3}s", t_step.elapsed().as_secs_f64());
     }
 
     // 5. Simplify clusters
     if !clusters.is_empty() {
+        let t_step = Instant::now();
         neatify_clusters(network, artifact_geoms, &clusters, &comp_labels, params)?;
+        log::info!("  [loop] neatify_clusters: {:.3}s", t_step.elapsed().as_secs_f64());
     }
 
     Ok(())
@@ -515,6 +549,7 @@ fn neatify_pairs(
             .collect();
         let mut new_geoms = Vec::new();
         let mut new_statuses = Vec::new();
+        let mut new_parents = Vec::new();
         // Build index mapping: old → new
         let mut idx_map: Vec<Option<usize>> = vec![None; network.geometries.len()];
         let mut new_idx = 0;
@@ -523,17 +558,20 @@ fn neatify_pairs(
                 idx_map[i] = Some(new_idx);
                 new_geoms.push(geom.clone());
                 new_statuses.push(network.statuses[i]);
+                new_parents.push(network.parent_ids[i].clone());
                 new_idx += 1;
             }
         }
         network.geometries = new_geoms;
         network.statuses = new_statuses;
+        network.parent_ids = new_parents;
 
         // Clean topology after drops
-        let (cleaned, statuses) =
-            nodes::remove_interstitial_nodes(&network.geometries, &network.statuses);
+        let (cleaned, statuses, cleaned_parents) =
+            nodes::remove_interstitial_nodes(&network.geometries, &network.statuses, &network.parent_ids);
         network.geometries = cleaned;
         network.statuses = statuses;
+        network.parent_ids = cleaned_parents;
     }
 
     // Dissolve drop_interline pairs into single polygons (mirrors Python
@@ -611,66 +649,78 @@ fn neatify_clusters(
     // Build R-tree once for all cluster lookups
     let tree = crate::spatial::build_rtree(&network.geometries);
 
-    for label in &sorted_cluster_labels {
-        let cluster = &cluster_groups[label];
-        if cluster.len() < 3 {
-            continue;
-        }
+    // Process clusters in parallel — each cluster only reads shared data
+    // (network.geometries, artifact_geoms, tree) and produces independent results.
+    use rayon::prelude::*;
 
-        // Merge all artifact polygons in the cluster
-        let mut merged: MultiPolygon<f64> = MultiPolygon(vec![artifact_geoms[cluster[0]].clone()]);
-        for &i in &cluster[1..] {
-            merged = merged.union(&MultiPolygon(vec![artifact_geoms[i].clone()]));
-        }
+    let eligible_clusters: Vec<&Vec<usize>> = sorted_cluster_labels
+        .iter()
+        .filter_map(|label| {
+            let cluster = &cluster_groups[label];
+            if cluster.len() >= 3 { Some(cluster) } else { None }
+        })
+        .collect();
 
-        if merged.0.is_empty() {
-            continue;
-        }
-
-        // Process each polygon part of the merged geometry (Python's union_all
-        // returns a MultiPolygon and processes all parts together)
-        let mut all_covered: Vec<usize> = Vec::new();
-        let mut all_cleaned: Vec<LineString<f64>> = Vec::new();
-
-        for merged_poly in &merged.0 {
-            let covered = find_covered_edges_with_tree(&network.geometries, &tree, merged_poly, params.eps);
-            if covered.is_empty() {
-                continue;
+    let t_clusters = Instant::now();
+    let cluster_results: Vec<(Vec<usize>, Vec<LineString<f64>>)> = eligible_clusters
+        .par_iter()
+        .map(|cluster| {
+            // Merge all artifact polygons in the cluster
+            let mut merged: MultiPolygon<f64> = MultiPolygon(vec![artifact_geoms[cluster[0]].clone()]);
+            for &i in &cluster[1..] {
+                merged = merged.union(&MultiPolygon(vec![artifact_geoms[i].clone()]));
             }
 
-            let boundary_edges =
-                find_boundary_edges_with_tree(&network.geometries, &tree, merged_poly, params.eps);
-            if boundary_edges.is_empty() {
+            if merged.0.is_empty() {
+                return (vec![], vec![]);
+            }
+
+            let mut all_covered: Vec<usize> = Vec::new();
+            let mut all_cleaned: Vec<LineString<f64>> = Vec::new();
+
+            for merged_poly in &merged.0 {
+                let covered = find_covered_edges_with_tree(&network.geometries, &tree, merged_poly, params.eps);
+                if covered.is_empty() {
+                    continue;
+                }
+
+                let boundary_edges =
+                    find_boundary_edges_with_tree(&network.geometries, &tree, merged_poly, params.eps);
+                if boundary_edges.is_empty() {
+                    all_covered.extend(&covered);
+                    continue;
+                }
+
+                let boundary_geoms: Vec<LineString<f64>> = boundary_edges
+                    .iter()
+                    .map(|&i| network.geometries[i].clone())
+                    .collect();
+                let (skel, _) = geometry::voronoi_skeleton(
+                    &boundary_geoms,
+                    Some(merged_poly),
+                    None,
+                    params.max_segment_length,
+                    None,
+                    None,
+                    params.clip_limit,
+                    Some(params.consolidation_tolerance),
+                );
                 all_covered.extend(&covered);
-                continue;
+                all_cleaned.extend(skel);
             }
 
-            let boundary_geoms: Vec<LineString<f64>> = boundary_edges
-                .iter()
-                .map(|&i| network.geometries[i].clone())
-                .collect();
-            let (skel, _) = geometry::voronoi_skeleton(
-                &boundary_geoms,
-                Some(merged_poly),
-                None,
-                params.max_segment_length,
-                None,
-                None,
-                params.clip_limit,
-                Some(params.consolidation_tolerance),
-            );
-            // Python's nx_gx_cluster does NOT remove dangles for multi-connection
-            // clusters — it adds all skeleton edges directly. Only single-connection
-            // cases get special dangle handling.
-            all_covered.extend(&covered);
-            all_cleaned.extend(skel);
-        }
+            (all_covered, all_cleaned)
+        })
+        .collect();
 
-        if !all_covered.is_empty() {
-            to_drop.extend(&all_covered);
-            to_add.extend(all_cleaned);
+    // Merge results from all clusters
+    for (covered, cleaned) in cluster_results {
+        if !covered.is_empty() {
+            to_drop.extend(covered);
+            to_add.extend(cleaned);
         }
     }
+    log::info!("    [clusters] {} clusters processed in {:.3}s", eligible_clusters.len(), t_clusters.elapsed().as_secs_f64());
 
     apply_changes(network, &to_drop, &to_add, params);
     Ok(())
@@ -1415,13 +1465,25 @@ fn apply_changes(
 
     let drop_set: HashSet<usize> = to_drop.iter().copied().collect();
 
+    // Compute union of parent_ids from ALL dropped edges BEFORE reassignment
+    let mut dropped_parents: Vec<usize> = Vec::new();
+    for &i in to_drop {
+        if i < network.parent_ids.len() {
+            dropped_parents.extend_from_slice(&network.parent_ids[i]);
+        }
+    }
+    dropped_parents.sort_unstable();
+    dropped_parents.dedup();
+
     let mut new_geoms = Vec::new();
     let mut new_statuses = Vec::new();
+    let mut new_parents = Vec::new();
 
     for (i, geom) in network.geometries.iter().enumerate() {
         if !drop_set.contains(&i) {
             new_geoms.push(geom.clone());
             new_statuses.push(network.statuses[i]);
+            new_parents.push(network.parent_ids[i].clone());
         }
     }
 
@@ -1436,18 +1498,22 @@ fn apply_changes(
             if simplified.0.len() >= 2 && Euclidean.length(&simplified) > params.eps {
                 new_geoms.push(simplified);
                 new_statuses.push(EdgeStatus::New);
+                // New skeleton edges inherit the union of ALL dropped edges' parent_ids
+                new_parents.push(dropped_parents.clone());
             }
         }
     }
 
     network.geometries = new_geoms;
     network.statuses = new_statuses;
+    network.parent_ids = new_parents;
 
     // Clean topology after changes
-    let (cleaned, statuses) =
-        nodes::remove_interstitial_nodes(&network.geometries, &network.statuses);
+    let (cleaned, statuses, cleaned_parents) =
+        nodes::remove_interstitial_nodes(&network.geometries, &network.statuses, &network.parent_ids);
     network.geometries = cleaned;
     network.statuses = statuses;
+    network.parent_ids = cleaned_parents;
 }
 
 /// Check if a CES classification represents an "identical" case
@@ -1494,12 +1560,14 @@ fn dedup_geometries(geoms: &[LineString<f64>]) -> Vec<LineString<f64>> {
 }
 
 /// Deduplicate a StreetNetwork in-place by normalized coordinate hash.
+/// Duplicate edges union their parent_ids into the survivor.
 fn dedup_network(network: &mut StreetNetwork) {
     use std::hash::{Hash, Hasher};
-    let mut seen = HashSet::new();
+    let mut seen: HashMap<u64, usize> = HashMap::new();
     let mut new_geoms = Vec::new();
     let mut new_statuses = Vec::new();
-    for (geom, &status) in network.geometries.iter().zip(network.statuses.iter()) {
+    let mut new_parents = Vec::new();
+    for (i, (geom, &status)) in network.geometries.iter().zip(network.statuses.iter()).enumerate() {
         let normalized = ops::normalize_linestring(geom);
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         normalized.0.len().hash(&mut hasher);
@@ -1507,13 +1575,26 @@ fn dedup_network(network: &mut StreetNetwork) {
             c.x.to_bits().hash(&mut hasher);
             c.y.to_bits().hash(&mut hasher);
         }
-        if seen.insert(hasher.finish()) {
+        let hash = hasher.finish();
+        if let Some(&survivor_idx) = seen.get(&hash) {
+            // Union parent_ids into the survivor
+            let survivor_parents: &mut Vec<usize> = &mut new_parents[survivor_idx];
+            for &p in &network.parent_ids[i] {
+                if !survivor_parents.contains(&p) {
+                    survivor_parents.push(p);
+                }
+            }
+            survivor_parents.sort_unstable();
+        } else {
+            seen.insert(hash, new_geoms.len());
             new_geoms.push(geom.clone());
             new_statuses.push(status);
+            new_parents.push(network.parent_ids[i].clone());
         }
     }
     network.geometries = new_geoms;
     network.statuses = new_statuses;
+    network.parent_ids = new_parents;
 }
 
 /// Find edge indices whose geometry is covered by the artifact polygon.
@@ -1634,9 +1715,11 @@ fn find_boundary_edges_with_tree(
         (min_x, min_y, max_x, max_y)
     };
 
-    candidates
-        .into_iter()
-        .filter(|&i| {
+    // Use rayon for parallel relate checks (these dominate runtime).
+    use rayon::prelude::*;
+    let results: Vec<bool> = candidates
+        .par_iter()
+        .map(|&i| {
             let geom = &geometries[i];
             // Fast bbox disjoint check
             if let Some(lr) = geom.bounding_rect() {
@@ -1652,6 +1735,12 @@ fn find_boundary_edges_with_tree(
             let touches_boundary = boundary_buf.0.iter().any(|p| geom.intersects(p));
             !is_covered && touches_boundary
         })
+        .collect();
+    candidates
+        .into_iter()
+        .zip(results)
+        .filter(|&(_, keep)| keep)
+        .map(|(i, _)| i)
         .collect()
 }
 

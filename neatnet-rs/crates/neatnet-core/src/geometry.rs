@@ -215,8 +215,9 @@ pub fn voronoi_skeleton(
     if let Some(ct) = consolidation_tolerance {
         if edgelines.len() >= 3 && ct > 0.0 {
             let temp_statuses = vec![crate::types::EdgeStatus::New; edgelines.len()];
-            let (consol, _) =
-                crate::nodes::consolidate_nodes(&edgelines, &temp_statuses, ct, true);
+            let temp_parents: Vec<Vec<usize>> = vec![vec![]; edgelines.len()];
+            let (consol, _, _) =
+                crate::nodes::consolidate_nodes(&edgelines, &temp_statuses, &temp_parents, ct, true);
             edgelines = consol;
             edgelines.retain(|e| e.0.len() >= 2 && Euclidean.length(e) > 0.0);
         }

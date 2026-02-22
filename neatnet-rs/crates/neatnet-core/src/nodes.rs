@@ -125,9 +125,10 @@ pub fn get_components(geometries: &[LineString<f64>]) -> Vec<usize> {
 pub fn remove_interstitial_nodes(
     geometries: &[LineString<f64>],
     statuses: &[EdgeStatus],
-) -> (Vec<LineString<f64>>, Vec<EdgeStatus>) {
+    parent_ids: &[Vec<usize>],
+) -> (Vec<LineString<f64>>, Vec<EdgeStatus>, Vec<Vec<usize>>) {
     if geometries.len() < 2 {
-        return (geometries.to_vec(), statuses.to_vec());
+        return (geometries.to_vec(), statuses.to_vec(), parent_ids.to_vec());
     }
 
     let labels = get_components(geometries);
@@ -139,6 +140,7 @@ pub fn remove_interstitial_nodes(
 
     let mut result_geoms = Vec::new();
     let mut result_statuses = Vec::new();
+    let mut result_parents = Vec::new();
 
     let mut sorted_labels: Vec<_> = groups.keys().copied().collect();
     sorted_labels.sort();
@@ -147,10 +149,19 @@ pub fn remove_interstitial_nodes(
         if indices.len() == 1 {
             result_geoms.push(geometries[indices[0]].clone());
             result_statuses.push(statuses[indices[0]]);
+            result_parents.push(parent_ids[indices[0]].clone());
         } else {
             let group_statuses: Vec<EdgeStatus> =
                 indices.iter().map(|&i| statuses[i]).collect();
             let merged_status = EdgeStatus::aggregate(&group_statuses);
+
+            // Union parent_ids from all edges in the merged chain
+            let mut merged_parents: Vec<usize> = Vec::new();
+            for &i in indices.iter() {
+                merged_parents.extend_from_slice(&parent_ids[i]);
+            }
+            merged_parents.sort_unstable();
+            merged_parents.dedup();
 
             let group_geoms: Vec<LineString<f64>> =
                 indices.iter().map(|&i| geometries[i].clone()).collect();
@@ -159,32 +170,37 @@ pub fn remove_interstitial_nodes(
             if merged.len() == 1 {
                 result_geoms.push(merged.into_iter().next().unwrap());
                 result_statuses.push(merged_status);
+                result_parents.push(merged_parents);
             } else {
                 // Fallback: keep individual geometries
                 for &idx in indices {
                     result_geoms.push(geometries[idx].clone());
                     result_statuses.push(statuses[idx]);
+                    result_parents.push(parent_ids[idx].clone());
                 }
             }
         }
     }
 
-    (result_geoms, result_statuses)
+    (result_geoms, result_statuses, result_parents)
 }
 
 /// Fix street network topology.
 pub fn fix_topology(
     geometries: &[LineString<f64>],
     statuses: &[EdgeStatus],
+    parent_ids: &[Vec<usize>],
     eps: f64,
-) -> (Vec<LineString<f64>>, Vec<EdgeStatus>) {
+) -> (Vec<LineString<f64>>, Vec<EdgeStatus>, Vec<Vec<usize>>) {
     // Step 1: Remove duplicates (by normalized coordinate hash)
+    // Use HashMap so duplicates union their parent_ids into the survivor
     use std::hash::{Hash, Hasher};
-    let mut seen = std::collections::HashSet::new();
+    let mut seen: HashMap<u64, usize> = HashMap::new();
     let mut deduped_geoms = Vec::new();
     let mut deduped_statuses = Vec::new();
+    let mut deduped_parents = Vec::new();
 
-    for (geom, &status) in geometries.iter().zip(statuses.iter()) {
+    for (i, (geom, &status)) in geometries.iter().zip(statuses.iter()).enumerate() {
         let normalized = ops::normalize_linestring(geom);
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         normalized.0.len().hash(&mut hasher);
@@ -192,27 +208,41 @@ pub fn fix_topology(
             c.x.to_bits().hash(&mut hasher);
             c.y.to_bits().hash(&mut hasher);
         }
-        if seen.insert(hasher.finish()) {
+        let hash = hasher.finish();
+        if let Some(&survivor_idx) = seen.get(&hash) {
+            // Union parent_ids into the survivor
+            let survivor_parents: &mut Vec<usize> = &mut deduped_parents[survivor_idx];
+            for &p in &parent_ids[i] {
+                if !survivor_parents.contains(&p) {
+                    survivor_parents.push(p);
+                }
+            }
+            survivor_parents.sort_unstable();
+        } else {
+            seen.insert(hash, deduped_geoms.len());
             deduped_geoms.push(geom.clone());
             deduped_statuses.push(status);
+            deduped_parents.push(parent_ids[i].clone());
         }
     }
 
     // Step 2: Induce nodes at intersections
-    let (induced_geoms, induced_statuses) = induce_nodes(&deduped_geoms, &deduped_statuses, eps);
+    let (induced_geoms, induced_statuses, induced_parents) =
+        induce_nodes(&deduped_geoms, &deduped_statuses, &deduped_parents, eps);
 
     // Step 3: Remove interstitial nodes
-    remove_interstitial_nodes(&induced_geoms, &induced_statuses)
+    remove_interstitial_nodes(&induced_geoms, &induced_statuses, &induced_parents)
 }
 
 /// Add missing nodes where line endpoints intersect other edges.
 pub fn induce_nodes(
     geometries: &[LineString<f64>],
     statuses: &[EdgeStatus],
+    parent_ids: &[Vec<usize>],
     eps: f64,
-) -> (Vec<LineString<f64>>, Vec<EdgeStatus>) {
+) -> (Vec<LineString<f64>>, Vec<EdgeStatus>, Vec<Vec<usize>>) {
     if geometries.is_empty() {
-        return (vec![], vec![]);
+        return (vec![], vec![], vec![]);
     }
 
     let mismatch_points = identify_degree_mismatch(geometries, eps);
@@ -232,10 +262,10 @@ pub fn induce_nodes(
     }
 
     if all_split_points.is_empty() {
-        return (geometries.to_vec(), statuses.to_vec());
+        return (geometries.to_vec(), statuses.to_vec(), parent_ids.to_vec());
     }
 
-    split_edges_at_points(geometries, statuses, &all_split_points, eps)
+    split_edges_at_points(geometries, statuses, parent_ids, &all_split_points, eps)
 }
 
 fn identify_degree_mismatch(geometries: &[LineString<f64>], eps: f64) -> Vec<Coord<f64>> {
@@ -339,11 +369,12 @@ fn makes_loop_contact(
 fn split_edges_at_points(
     geometries: &[LineString<f64>],
     statuses: &[EdgeStatus],
+    parent_ids: &[Vec<usize>],
     split_points: &[Coord<f64>],
     eps: f64,
-) -> (Vec<LineString<f64>>, Vec<EdgeStatus>) {
+) -> (Vec<LineString<f64>>, Vec<EdgeStatus>, Vec<Vec<usize>>) {
     if split_points.is_empty() {
-        return (geometries.to_vec(), statuses.to_vec());
+        return (geometries.to_vec(), statuses.to_vec(), parent_ids.to_vec());
     }
 
     // Build R-tree ONCE and collect all split points per edge
@@ -369,6 +400,7 @@ fn split_edges_at_points(
     // Apply all splits at once
     let mut result_geoms = Vec::with_capacity(geometries.len());
     let mut result_statuses = Vec::with_capacity(geometries.len());
+    let mut result_parents = Vec::with_capacity(geometries.len());
 
     for (idx, geom) in geometries.iter().enumerate() {
         if let Some(pts) = edge_split_points.get(&idx) {
@@ -386,17 +418,20 @@ fn split_edges_at_points(
                 }
                 parts = new_parts;
             }
+            // Each piece inherits the original's parent_ids
             for part in parts {
                 result_geoms.push(part);
                 result_statuses.push(EdgeStatus::Changed);
+                result_parents.push(parent_ids[idx].clone());
             }
         } else {
             result_geoms.push(geom.clone());
             result_statuses.push(statuses[idx]);
+            result_parents.push(parent_ids[idx].clone());
         }
     }
 
-    (result_geoms, result_statuses)
+    (result_geoms, result_statuses, result_parents)
 }
 
 /// Snap a point onto a line and split the line at that point.
@@ -479,24 +514,26 @@ fn snap_n_split(edge: &LineString<f64>, point: Coord<f64>, eps: f64) -> Vec<Line
 pub fn consolidate_nodes(
     geometries: &[LineString<f64>],
     statuses: &[EdgeStatus],
+    parent_ids: &[Vec<usize>],
     tolerance: f64,
     preserve_ends: bool,
-) -> (Vec<LineString<f64>>, Vec<EdgeStatus>) {
-    consolidate_nodes_with_tree(geometries, statuses, tolerance, preserve_ends, None)
+) -> (Vec<LineString<f64>>, Vec<EdgeStatus>, Vec<Vec<usize>>) {
+    consolidate_nodes_with_tree(geometries, statuses, parent_ids, tolerance, preserve_ends, None)
 }
 
 /// Consolidate nearby nodes, optionally reusing a pre-built R-tree for the spider phase.
 pub fn consolidate_nodes_with_tree(
     geometries: &[LineString<f64>],
     statuses: &[EdgeStatus],
+    parent_ids: &[Vec<usize>],
     tolerance: f64,
     preserve_ends: bool,
     geom_tree: Option<&RTree<crate::spatial::IndexedEnvelope>>,
-) -> (Vec<LineString<f64>>, Vec<EdgeStatus>) {
+) -> (Vec<LineString<f64>>, Vec<EdgeStatus>, Vec<Vec<usize>>) {
     let (node_coords, degrees) = nodes_from_edges(geometries);
 
     if node_coords.len() < 2 {
-        return (geometries.to_vec(), statuses.to_vec());
+        return (geometries.to_vec(), statuses.to_vec(), parent_ids.to_vec());
     }
 
     let candidate_indices: Vec<usize> = (0..node_coords.len())
@@ -504,7 +541,7 @@ pub fn consolidate_nodes_with_tree(
         .collect();
 
     if candidate_indices.len() < 2 {
-        return (geometries.to_vec(), statuses.to_vec());
+        return (geometries.to_vec(), statuses.to_vec(), parent_ids.to_vec());
     }
 
     // Build R-tree and proximity graph
@@ -565,7 +602,7 @@ pub fn consolidate_nodes_with_tree(
     }
 
     if proximity_components.is_empty() {
-        return (geometries.to_vec(), statuses.to_vec());
+        return (geometries.to_vec(), statuses.to_vec(), parent_ids.to_vec());
     }
 
     // Hierarchical clustering per proximity component
@@ -693,7 +730,7 @@ pub fn consolidate_nodes_with_tree(
     }
 
     if cluster_info.is_empty() {
-        return (geometries.to_vec(), statuses.to_vec());
+        return (geometries.to_vec(), statuses.to_vec(), parent_ids.to_vec());
     }
 
     // Apply spider geometry — reuse caller's tree if provided
@@ -708,7 +745,9 @@ pub fn consolidate_nodes_with_tree(
 
     let mut result_geoms: Vec<LineString<f64>> = geometries.to_vec();
     let mut result_statuses: Vec<EdgeStatus> = statuses.to_vec();
+    let mut result_parents: Vec<Vec<usize>> = parent_ids.to_vec();
     let mut new_spiders: Vec<LineString<f64>> = Vec::new();
+    let mut new_spider_parents: Vec<Vec<usize>> = Vec::new();
 
     for (centroid, cookie) in &cluster_info {
         let candidates = envelope_query_indices(effective_tree, cookie);
@@ -777,15 +816,20 @@ pub fn consolidate_nodes_with_tree(
                 // Entire line was inside cookie — empty it
                 result_geoms[idx] = LineString::new(vec![]);
                 result_statuses[idx] = EdgeStatus::Changed;
+                // parent_ids stays (will be filtered out with empty geom)
             } else if diff_lines.len() == 1 {
                 result_geoms[idx] = diff_lines.into_iter().next().unwrap();
                 result_statuses[idx] = EdgeStatus::Changed;
+                // parent_ids[idx] stays — clipped part inherits original
             } else {
                 // Multiple parts: keep first, add rest as new edges
                 result_geoms[idx] = diff_lines[0].clone();
                 result_statuses[idx] = EdgeStatus::Changed;
+                // parent_ids[idx] stays for first part
                 for part in &diff_lines[1..] {
                     new_spiders.push(part.clone());
+                    // Clipped parts inherit original's parent_ids
+                    new_spider_parents.push(result_parents[idx].clone());
                 }
             }
 
@@ -796,28 +840,34 @@ pub fn consolidate_nodes_with_tree(
                     Coord { x: centroid[0], y: centroid[1] },
                 ]);
                 new_spiders.push(spider);
+                // Spider lines are truly synthesized — empty parent_ids
+                new_spider_parents.push(vec![]);
             }
         }
     }
 
     // Add spiders and remove empty geometries
-    for spider in new_spiders {
+    for (spider, sp_parents) in new_spiders.into_iter().zip(new_spider_parents.into_iter()) {
         result_geoms.push(spider);
         result_statuses.push(EdgeStatus::New);
+        result_parents.push(sp_parents);
     }
 
     let mut final_geoms = Vec::new();
     let mut final_statuses = Vec::new();
+    let mut final_parents = Vec::new();
 
-    for (geom, status) in result_geoms.iter().zip(result_statuses.iter()) {
+    for ((geom, status), parents) in result_geoms.iter().zip(result_statuses.iter()).zip(result_parents.iter()) {
         if geom.0.len() >= 2 {
             final_geoms.push(geom.clone());
             final_statuses.push(*status);
+            final_parents.push(parents.clone());
         }
     }
 
-    let (out_geoms, out_statuses) = remove_interstitial_nodes(&final_geoms, &final_statuses);
-    (out_geoms, out_statuses)
+    let (out_geoms, out_statuses, out_parents) =
+        remove_interstitial_nodes(&final_geoms, &final_statuses, &final_parents);
+    (out_geoms, out_statuses, out_parents)
 }
 
 /// Query R-tree for line indices near a polygon's bounding box.
@@ -970,8 +1020,9 @@ mod tests {
         let g1 = make_line(&[[0.0, 0.0], [5.0, 0.0]]);
         let g2 = make_line(&[[5.5, 0.0], [10.0, 0.0]]);
         let statuses = vec![EdgeStatus::Original, EdgeStatus::Original];
-        let (result_geoms, result_statuses) =
-            consolidate_nodes(&[g1, g2], &statuses, 2.0, false);
+        let parents = vec![vec![0], vec![1]];
+        let (result_geoms, result_statuses, _) =
+            consolidate_nodes(&[g1, g2], &statuses, &parents, 2.0, false);
         assert!(!result_geoms.is_empty());
         let total_len: f64 = result_geoms.iter().map(|g| Euclidean.length(g)).sum();
         assert!(total_len > 8.0, "Expected total length > 8, got {}", total_len);
@@ -987,8 +1038,9 @@ mod tests {
         let g1 = make_line(&[[0.0, 0.0], [1.0, 0.0]]);
         let g2 = make_line(&[[100.0, 0.0], [200.0, 0.0]]);
         let statuses = vec![EdgeStatus::Original, EdgeStatus::Original];
-        let (result_geoms, _result_statuses) =
-            consolidate_nodes(&[g1, g2], &statuses, 2.0, false);
+        let parents = vec![vec![0], vec![1]];
+        let (result_geoms, _result_statuses, _) =
+            consolidate_nodes(&[g1, g2], &statuses, &parents, 2.0, false);
         assert_eq!(result_geoms.len(), 1);
     }
 
@@ -998,7 +1050,8 @@ mod tests {
         let g2 = make_line(&[[5.0, 0.0], [10.0, 0.0]]);
         let g3 = make_line(&[[5.0, 0.0], [5.0, 5.0]]);
         let statuses = vec![EdgeStatus::Original; 3];
-        let (result_geoms, _) = consolidate_nodes(&[g1, g2, g3], &statuses, 2.0, true);
+        let parents = vec![vec![0], vec![1], vec![2]];
+        let (result_geoms, _, _) = consolidate_nodes(&[g1, g2, g3], &statuses, &parents, 2.0, true);
         assert!(result_geoms.len() >= 3);
     }
 
@@ -1049,7 +1102,8 @@ mod tests {
         let g1 = make_line(&[[0.0, 0.0], [10.0, 0.0]]);
         let g2 = make_line(&[[5.0, -5.0], [5.0, 0.0]]);
         let statuses = vec![EdgeStatus::Original; 2];
-        let (result_geoms, _) = induce_nodes(&[g1, g2], &statuses, 1e-4);
+        let parents = vec![vec![0], vec![1]];
+        let (result_geoms, _, _) = induce_nodes(&[g1, g2], &statuses, &parents, 1e-4);
         assert!(result_geoms.len() >= 3, "Expected at least 3 edges, got {}", result_geoms.len());
     }
 }

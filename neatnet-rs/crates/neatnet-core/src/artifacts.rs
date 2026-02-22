@@ -253,14 +253,16 @@ pub fn get_artifacts(
         return None;
     }
 
-    // 2. Compute FAI values
-    let mut fai_values = Vec::with_capacity(poly_geoms.len());
-    for poly in &poly_geoms {
-        let area = poly.unsigned_area();
-        let mbc_ratio = minimum_bounding_circle_ratio(poly);
-        let fai = (mbc_ratio * area).ln();
-        fai_values.push(fai);
-    }
+    // 2. Compute FAI values (parallelized — MBC via Welzl is expensive)
+    use rayon::prelude::*;
+    let fai_values: Vec<f64> = poly_geoms
+        .par_iter()
+        .map(|poly| {
+            let area = poly.unsigned_area();
+            let mbc_ratio = minimum_bounding_circle_ratio(poly);
+            (mbc_ratio * area).ln()
+        })
+        .collect();
 
     // 3. Determine FAI threshold
     let final_threshold = if let Some(t) = threshold {

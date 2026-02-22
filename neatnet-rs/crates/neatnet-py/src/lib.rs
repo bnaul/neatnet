@@ -161,11 +161,14 @@ fn neatify<'py>(
     n_loops: usize,
 ) -> PyResult<Bound<'py, PyAny>> {
     let (geo_geoms, _batch, _schema, metadata) = table_to_linestrings(table)?;
-    let statuses = vec![neatnet_core::EdgeStatus::Original; geo_geoms.len()];
+    let n_input = geo_geoms.len();
+    let statuses = vec![neatnet_core::EdgeStatus::Original; n_input];
+    let parent_ids: Vec<Vec<usize>> = (0..n_input).map(|i| vec![i]).collect();
 
     let mut network = neatnet_core::StreetNetwork {
         geometries: geo_geoms,
         statuses,
+        parent_ids,
         attributes: None,
         crs: None,
     };
@@ -199,8 +202,26 @@ fn neatify<'py>(
     let status_ref: ArrayRef = Arc::new(status_array);
     let status_field = Field::new("status", DataType::Utf8, false);
 
-    let result_schema = Arc::new(Schema::new(vec![geom_field, status_field]));
-    let result_batch = RecordBatch::try_new(result_schema.clone(), vec![geom_ref, status_ref])
+    // Build parent_ids column as List<UInt32>
+    use arrow::array::{ListBuilder, UInt32Builder};
+    let mut parent_ids_builder = ListBuilder::new(UInt32Builder::new());
+    for parents in &network.parent_ids {
+        let values = parent_ids_builder.values();
+        for &p in parents {
+            values.append_value(p as u32);
+        }
+        parent_ids_builder.append(true);
+    }
+    let parent_ids_array = parent_ids_builder.finish();
+    let parent_ids_ref: ArrayRef = Arc::new(parent_ids_array);
+    let parent_ids_field = Field::new(
+        "parent_ids",
+        DataType::List(Arc::new(Field::new("item", DataType::UInt32, true))),
+        false,
+    );
+
+    let result_schema = Arc::new(Schema::new(vec![geom_field, status_field, parent_ids_field]));
+    let result_batch = RecordBatch::try_new(result_schema.clone(), vec![geom_ref, status_ref, parent_ids_ref])
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
     PyTable::try_new(vec![result_batch], result_schema)?.into_pyarrow(py)
@@ -301,11 +322,14 @@ fn neatify_wkt(
         .filter_map(|wkt| wkt_to_linestring(wkt))
         .collect();
 
-    let statuses = vec![neatnet_core::EdgeStatus::Original; geometries.len()];
+    let n_input = geometries.len();
+    let statuses = vec![neatnet_core::EdgeStatus::Original; n_input];
+    let parent_ids: Vec<Vec<usize>> = (0..n_input).map(|i| vec![i]).collect();
 
     let mut network = neatnet_core::StreetNetwork {
         geometries,
         statuses,
+        parent_ids,
         attributes: None,
         crs: None,
     };
@@ -333,10 +357,16 @@ fn neatify_wkt(
         .map(|g| linestring_to_wkt(g))
         .collect();
     let status_strs: Vec<&str> = network.statuses.iter().map(|s| s.as_str()).collect();
+    let parent_ids_out: Vec<Vec<u32>> = network
+        .parent_ids
+        .iter()
+        .map(|ps| ps.iter().map(|&p| p as u32).collect())
+        .collect();
 
     let dict = pyo3::types::PyDict::new(py);
     dict.set_item("geometries", geom_wkts)?;
     dict.set_item("statuses", status_strs)?;
+    dict.set_item("parent_ids", parent_ids_out)?;
     Ok(dict.into())
 }
 

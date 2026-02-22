@@ -72,6 +72,9 @@ pub struct StreetNetwork {
     pub geometries: Vec<LineString<f64>>,
     /// Per-edge status tracking.
     pub statuses: Vec<EdgeStatus>,
+    /// Per-edge lineage: indices of original input edges that contributed to each output edge.
+    /// Parallel to `geometries`/`statuses`. Empty vec for synthesized edges (e.g. spider lines).
+    pub parent_ids: Vec<Vec<usize>>,
     /// Optional Arrow RecordBatch holding non-geometry attribute columns.
     pub attributes: Option<arrow::record_batch::RecordBatch>,
     /// Coordinate reference system identifier (e.g. "EPSG:32637").

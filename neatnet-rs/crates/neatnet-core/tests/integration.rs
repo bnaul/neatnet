@@ -30,10 +30,13 @@ fn test_apalachicola_neatify() {
     let geoms = load_wkt_geometries("tests/data/apalachicola_input.wkt");
     assert_eq!(geoms.len(), 1782, "Expected 1782 input geometries");
 
-    let statuses = vec![EdgeStatus::Original; geoms.len()];
+    let n = geoms.len();
+    let statuses = vec![EdgeStatus::Original; n];
+    let parent_ids: Vec<Vec<usize>> = (0..n).map(|i| vec![i]).collect();
     let mut network = StreetNetwork {
         geometries: geoms,
         statuses,
+        parent_ids,
         attributes: None,
         crs: Some("EPSG:3857".to_string()),
     };
@@ -90,12 +93,14 @@ fn test_apalachicola_topology_only() {
     let geoms = load_wkt_geometries("tests/data/apalachicola_input.wkt");
     assert_eq!(geoms.len(), 1782);
 
-    let statuses = vec![EdgeStatus::Original; geoms.len()];
+    let n = geoms.len();
+    let statuses = vec![EdgeStatus::Original; n];
+    let parent_ids: Vec<Vec<usize>> = (0..n).map(|i| vec![i]).collect();
     let params = NeatifyParams::default();
 
     // Step 1: Fix topology
-    let (fixed_geoms, fixed_statuses) =
-        neatnet_core::nodes::fix_topology(&geoms, &statuses, params.eps);
+    let (fixed_geoms, fixed_statuses, fixed_parents) =
+        neatnet_core::nodes::fix_topology(&geoms, &statuses, &parent_ids, params.eps);
 
     println!("After fix_topology: {} edges", fixed_geoms.len());
     // fix_topology merges degree-2 chains via remove_interstitial_nodes,
@@ -107,9 +112,10 @@ fn test_apalachicola_topology_only() {
     );
 
     // Step 2: Consolidate nodes
-    let (consol_geoms, _consol_statuses) = neatnet_core::nodes::consolidate_nodes(
+    let (consol_geoms, _consol_statuses, _) = neatnet_core::nodes::consolidate_nodes(
         &fixed_geoms,
         &fixed_statuses,
+        &fixed_parents,
         params.max_segment_length * 2.1,
         false,
     );
@@ -141,7 +147,8 @@ fn test_apalachicola_topology_only() {
 fn test_apalachicola_fix_topology_steps() {
     // Diagnose where length is lost in fix_topology
     let geoms = load_wkt_geometries("tests/data/apalachicola_input.wkt");
-    let statuses = vec![EdgeStatus::Original; geoms.len()];
+    let n = geoms.len();
+    let statuses = vec![EdgeStatus::Original; n];
 
     let orig_length: f64 = geoms.iter().map(|g| Euclidean.length(g)).sum();
     println!("Input: {} edges, length {:.2}", geoms.len(), orig_length);
@@ -150,12 +157,14 @@ fn test_apalachicola_fix_topology_steps() {
     let mut seen = std::collections::HashSet::new();
     let mut deduped = Vec::new();
     let mut deduped_st = Vec::new();
-    for (geom, &status) in geoms.iter().zip(statuses.iter()) {
+    let mut deduped_parents = Vec::new();
+    for (i, (geom, &status)) in geoms.iter().zip(statuses.iter()).enumerate() {
         let normalized = ops::normalize_linestring(geom);
         let wkt_str = ops::linestring_to_wkt(&normalized);
         if seen.insert(wkt_str) {
             deduped.push(geom.clone());
             deduped_st.push(status);
+            deduped_parents.push(vec![i]);
         }
     }
     let dedup_len: f64 = deduped.iter().map(|g| Euclidean.length(g)).sum();
@@ -163,13 +172,13 @@ fn test_apalachicola_fix_topology_steps() {
         deduped.len(), dedup_len, dedup_len / orig_length);
 
     // Step 2: Induce nodes
-    let (induced, induced_st) = nodes::induce_nodes(&deduped, &deduped_st, 1e-4);
+    let (induced, induced_st, induced_parents) = nodes::induce_nodes(&deduped, &deduped_st, &deduped_parents, 1e-4);
     let induced_len: f64 = induced.iter().map(|g| Euclidean.length(g)).sum();
     println!("After induce_nodes: {} edges, length {:.2} (ratio {:.3})",
         induced.len(), induced_len, induced_len / orig_length);
 
     // Step 3: Remove interstitial
-    let (cleaned, _) = nodes::remove_interstitial_nodes(&induced, &induced_st);
+    let (cleaned, _, _) = nodes::remove_interstitial_nodes(&induced, &induced_st, &induced_parents);
     let cleaned_len: f64 = cleaned.iter().map(|g| Euclidean.length(g)).sum();
     println!("After remove_interstitial: {} edges, length {:.2} (ratio {:.3})",
         cleaned.len(), cleaned_len, cleaned_len / orig_length);
@@ -179,20 +188,22 @@ fn test_apalachicola_fix_topology_steps() {
 fn test_apalachicola_pipeline_steps() {
     // Diagnostic test: trace each pipeline step
     let geoms = load_wkt_geometries("tests/data/apalachicola_input.wkt");
-    let statuses = vec![EdgeStatus::Original; geoms.len()];
+    let n = geoms.len();
+    let statuses = vec![EdgeStatus::Original; n];
+    let parent_ids: Vec<Vec<usize>> = (0..n).map(|i| vec![i]).collect();
     let params = NeatifyParams::default();
 
     println!("=== Step 0: Input ===");
     println!("  Edges: {}", geoms.len());
 
     // Step 1: Fix topology
-    let (fixed, fixed_st) = nodes::fix_topology(&geoms, &statuses, params.eps);
+    let (fixed, fixed_st, fixed_parents) = nodes::fix_topology(&geoms, &statuses, &parent_ids, params.eps);
     println!("=== Step 1: fix_topology ===");
     println!("  Edges: {}", fixed.len());
 
     // Step 2: Consolidate nodes
-    let (consol, _consol_st) = nodes::consolidate_nodes(
-        &fixed, &fixed_st, params.max_segment_length * 2.1, false,
+    let (consol, _consol_st, _) = nodes::consolidate_nodes(
+        &fixed, &fixed_st, &fixed_parents, params.max_segment_length * 2.1, false,
     );
     println!("=== Step 2: consolidate_nodes ===");
     println!("  Edges: {}", consol.len());

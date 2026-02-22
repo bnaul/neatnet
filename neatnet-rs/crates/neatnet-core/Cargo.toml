@@ -24,9 +24,10 @@ hashbrown = { workspace = true }
 
 # Optional deps for CLI binary
 parquet = { workspace = true, optional = true }
+env_logger = { workspace = true, optional = true }
 
 [features]
-cli = ["dep:parquet"]
+cli = ["dep:parquet", "dep:env_logger"]
 
 [[bin]]
 name = "profile_neatify"

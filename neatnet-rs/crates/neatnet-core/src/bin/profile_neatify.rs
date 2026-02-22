@@ -119,6 +119,10 @@ fn parse_wkb_linestring(wkb: &[u8]) -> Option<LineString<f64>> {
 }
 
 fn main() {
+    env_logger::Builder::from_default_env()
+        .filter_level(log::LevelFilter::Info)
+        .init();
+
     let args: Vec<String> = std::env::args().collect();
     let input_path = args
         .get(1)
@@ -143,10 +147,13 @@ fn main() {
         t0.elapsed().as_secs_f64()
     );
 
-    let statuses = vec![EdgeStatus::Original; geometries.len()];
+    let n_edges = geometries.len();
+    let statuses = vec![EdgeStatus::Original; n_edges];
+    let parent_ids: Vec<Vec<usize>> = (0..n_edges).map(|i| vec![i]).collect();
     let mut network = StreetNetwork {
         geometries,
         statuses,
+        parent_ids,
         attributes: None,
         crs: None,
     };
