@@ -135,6 +135,8 @@ fn wkt_to_polygon(wkt_str: &str) -> Option<geo_types::Polygon<f64>> {
 #[pyfunction]
 #[pyo3(signature = (
     table,
+    *,
+    edge_ids=None,
     max_segment_length=1.0,
     min_dangle_length=20.0,
     clip_limit=2.0,
@@ -149,6 +151,7 @@ fn wkt_to_polygon(wkt_str: &str) -> Option<geo_types::Polygon<f64>> {
 fn neatify<'py>(
     py: Python<'py>,
     table: PyTable,
+    edge_ids: Option<Vec<u64>>,
     max_segment_length: f64,
     min_dangle_length: f64,
     clip_limit: f64,
@@ -163,7 +166,17 @@ fn neatify<'py>(
     let (geo_geoms, _batch, _schema, metadata) = table_to_linestrings(table)?;
     let n_input = geo_geoms.len();
     let statuses = vec![neatnet_core::EdgeStatus::Original; n_input];
-    let parent_ids: Vec<Vec<usize>> = (0..n_input).map(|i| vec![i]).collect();
+    let parent_ids: Vec<Vec<usize>> = match edge_ids {
+        Some(ids) => {
+            if ids.len() != n_input {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("edge_ids length ({}) != number of geometries ({})", ids.len(), n_input)
+                ));
+            }
+            ids.into_iter().map(|id| vec![id as usize]).collect()
+        }
+        None => (0..n_input).map(|i| vec![i]).collect(),
+    };
 
     let mut network = neatnet_core::StreetNetwork {
         geometries: geo_geoms,
@@ -202,13 +215,13 @@ fn neatify<'py>(
     let status_ref: ArrayRef = Arc::new(status_array);
     let status_field = Field::new("status", DataType::Utf8, false);
 
-    // Build parent_ids column as List<UInt32>
-    use arrow::array::{ListBuilder, UInt32Builder};
-    let mut parent_ids_builder = ListBuilder::new(UInt32Builder::new());
+    // Build parent_ids column as List<UInt64>
+    use arrow::array::{ListBuilder, UInt64Builder};
+    let mut parent_ids_builder = ListBuilder::new(UInt64Builder::new());
     for parents in &network.parent_ids {
         let values = parent_ids_builder.values();
         for &p in parents {
-            values.append_value(p as u32);
+            values.append_value(p as u64);
         }
         parent_ids_builder.append(true);
     }
@@ -216,7 +229,7 @@ fn neatify<'py>(
     let parent_ids_ref: ArrayRef = Arc::new(parent_ids_array);
     let parent_ids_field = Field::new(
         "parent_ids",
-        DataType::List(Arc::new(Field::new("item", DataType::UInt32, true))),
+        DataType::List(Arc::new(Field::new("item", DataType::UInt64, true))),
         false,
     );
 
@@ -292,6 +305,8 @@ fn coins<'py>(
 #[pyfunction]
 #[pyo3(signature = (
     wkt_geometries,
+    *,
+    edge_ids=None,
     max_segment_length=1.0,
     min_dangle_length=20.0,
     clip_limit=2.0,
@@ -306,6 +321,7 @@ fn coins<'py>(
 fn neatify_wkt(
     py: Python<'_>,
     wkt_geometries: Vec<String>,
+    edge_ids: Option<Vec<u64>>,
     max_segment_length: f64,
     min_dangle_length: f64,
     clip_limit: f64,
@@ -324,7 +340,17 @@ fn neatify_wkt(
 
     let n_input = geometries.len();
     let statuses = vec![neatnet_core::EdgeStatus::Original; n_input];
-    let parent_ids: Vec<Vec<usize>> = (0..n_input).map(|i| vec![i]).collect();
+    let parent_ids: Vec<Vec<usize>> = match edge_ids {
+        Some(ids) => {
+            if ids.len() != n_input {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("edge_ids length ({}) != number of geometries ({})", ids.len(), n_input)
+                ));
+            }
+            ids.into_iter().map(|id| vec![id as usize]).collect()
+        }
+        None => (0..n_input).map(|i| vec![i]).collect(),
+    };
 
     let mut network = neatnet_core::StreetNetwork {
         geometries,
@@ -357,10 +383,10 @@ fn neatify_wkt(
         .map(|g| linestring_to_wkt(g))
         .collect();
     let status_strs: Vec<&str> = network.statuses.iter().map(|s| s.as_str()).collect();
-    let parent_ids_out: Vec<Vec<u32>> = network
+    let parent_ids_out: Vec<Vec<u64>> = network
         .parent_ids
         .iter()
-        .map(|ps| ps.iter().map(|&p| p as u32).collect())
+        .map(|ps| ps.iter().map(|&p| p as u64).collect())
         .collect();
 
     let dict = pyo3::types::PyDict::new(py);

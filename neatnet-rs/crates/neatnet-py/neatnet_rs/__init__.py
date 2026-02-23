@@ -21,6 +21,8 @@ def neatify(streets: gpd.GeoDataFrame, **kwargs) -> gpd.GeoDataFrame:
     ----------
     streets : GeoDataFrame
         Input street network with LineString geometry.
+        The DataFrame index is preserved through the pipeline: output
+        ``parent_ids`` will reference the original index values.
     **kwargs
         Forwarded to the Rust neatify function.
 
@@ -28,10 +30,11 @@ def neatify(streets: gpd.GeoDataFrame, **kwargs) -> gpd.GeoDataFrame:
     -------
     GeoDataFrame
         Simplified street network with geometry, status, and parent_ids columns.
-        parent_ids is a PyArrow-backed list<uint32> column for zero-copy performance.
+        parent_ids is a PyArrow-backed list<uint64> column for zero-copy performance.
     """
     table = streets.to_arrow(geometry_encoding="geoarrow")
-    arrow_table = _neatify_arrow(table, **kwargs)
+    edge_ids = streets.index.to_numpy(dtype="uint64").tolist()
+    arrow_table = _neatify_arrow(table, edge_ids=edge_ids, **kwargs)
     # Pull parent_ids out before GeoDataFrame.from_arrow() (which would
     # materialize it as Python lists), then re-attach as ArrowDtype-backed.
     parent_ids_col = arrow_table.column("parent_ids")
