@@ -123,15 +123,15 @@ pub fn get_components(geometries: &[LineString<f64>]) -> Vec<usize> {
 
 /// Remove interstitial (degree-2) nodes by merging edge chains.
 pub fn remove_interstitial_nodes(
-    geometries: &[LineString<f64>],
-    statuses: &[EdgeStatus],
-    parent_ids: &[Vec<usize>],
+    mut geometries: Vec<LineString<f64>>,
+    statuses: Vec<EdgeStatus>,
+    mut parent_ids: Vec<Vec<usize>>,
 ) -> (Vec<LineString<f64>>, Vec<EdgeStatus>, Vec<Vec<usize>>) {
     if geometries.len() < 2 {
-        return (geometries.to_vec(), statuses.to_vec(), parent_ids.to_vec());
+        return (geometries, statuses, parent_ids);
     }
 
-    let labels = get_components(geometries);
+    let labels = get_components(&geometries);
 
     let mut groups: HashMap<usize, Vec<usize>> = HashMap::new();
     for (idx, &label) in labels.iter().enumerate() {
@@ -147,9 +147,10 @@ pub fn remove_interstitial_nodes(
     for label in sorted_labels {
         let indices = &groups[&label];
         if indices.len() == 1 {
-            result_geoms.push(geometries[indices[0]].clone());
+            // Move instead of clone — zero allocation
+            result_geoms.push(std::mem::replace(&mut geometries[indices[0]], LineString::new(vec![])));
             result_statuses.push(statuses[indices[0]]);
-            result_parents.push(parent_ids[indices[0]].clone());
+            result_parents.push(std::mem::take(&mut parent_ids[indices[0]]));
         } else {
             let group_statuses: Vec<EdgeStatus> =
                 indices.iter().map(|&i| statuses[i]).collect();
@@ -163,8 +164,9 @@ pub fn remove_interstitial_nodes(
             merged_parents.sort_unstable();
             merged_parents.dedup();
 
+            // Move geometries out instead of cloning
             let group_geoms: Vec<LineString<f64>> =
-                indices.iter().map(|&i| geometries[i].clone()).collect();
+                indices.iter().map(|&i| std::mem::replace(&mut geometries[i], LineString::new(vec![]))).collect();
             let merged = ops::line_merge(&group_geoms);
 
             if merged.len() == 1 {
@@ -172,11 +174,11 @@ pub fn remove_interstitial_nodes(
                 result_statuses.push(merged_status);
                 result_parents.push(merged_parents);
             } else {
-                // Fallback: keep individual geometries
+                // Fallback: keep individual geometries (already moved out of input)
+                result_geoms.extend(group_geoms);
                 for &idx in indices {
-                    result_geoms.push(geometries[idx].clone());
                     result_statuses.push(statuses[idx]);
-                    result_parents.push(parent_ids[idx].clone());
+                    result_parents.push(std::mem::take(&mut parent_ids[idx]));
                 }
             }
         }
@@ -187,9 +189,9 @@ pub fn remove_interstitial_nodes(
 
 /// Fix street network topology.
 pub fn fix_topology(
-    geometries: &[LineString<f64>],
-    statuses: &[EdgeStatus],
-    parent_ids: &[Vec<usize>],
+    mut geometries: Vec<LineString<f64>>,
+    statuses: Vec<EdgeStatus>,
+    mut parent_ids: Vec<Vec<usize>>,
     eps: f64,
 ) -> (Vec<LineString<f64>>, Vec<EdgeStatus>, Vec<Vec<usize>>) {
     // Step 1: Remove duplicates (by normalized coordinate hash)
@@ -200,8 +202,8 @@ pub fn fix_topology(
     let mut deduped_statuses = Vec::new();
     let mut deduped_parents = Vec::new();
 
-    for (i, (geom, &status)) in geometries.iter().zip(statuses.iter()).enumerate() {
-        let normalized = ops::normalize_linestring(geom);
+    for i in 0..geometries.len() {
+        let normalized = ops::normalize_linestring(&geometries[i]);
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         normalized.0.len().hash(&mut hasher);
         for c in &normalized.0 {
@@ -220,9 +222,10 @@ pub fn fix_topology(
             survivor_parents.sort_unstable();
         } else {
             seen.insert(hash, deduped_geoms.len());
-            deduped_geoms.push(geom.clone());
-            deduped_statuses.push(status);
-            deduped_parents.push(parent_ids[i].clone());
+            // Move instead of clone
+            deduped_geoms.push(std::mem::replace(&mut geometries[i], LineString::new(vec![])));
+            deduped_statuses.push(statuses[i]);
+            deduped_parents.push(std::mem::take(&mut parent_ids[i]));
         }
     }
 
@@ -231,7 +234,7 @@ pub fn fix_topology(
         induce_nodes(&deduped_geoms, &deduped_statuses, &deduped_parents, eps);
 
     // Step 3: Remove interstitial nodes
-    remove_interstitial_nodes(&induced_geoms, &induced_statuses, &induced_parents)
+    remove_interstitial_nodes(induced_geoms, induced_statuses, induced_parents)
 }
 
 /// Add missing nodes where line endpoints intersect other edges.
@@ -857,17 +860,15 @@ pub fn consolidate_nodes_with_tree(
     let mut final_statuses = Vec::new();
     let mut final_parents = Vec::new();
 
-    for ((geom, status), parents) in result_geoms.iter().zip(result_statuses.iter()).zip(result_parents.iter()) {
+    for ((geom, status), parents) in result_geoms.into_iter().zip(result_statuses).zip(result_parents) {
         if geom.0.len() >= 2 {
-            final_geoms.push(geom.clone());
-            final_statuses.push(*status);
-            final_parents.push(parents.clone());
+            final_geoms.push(geom);
+            final_statuses.push(status);
+            final_parents.push(parents);
         }
     }
 
-    let (out_geoms, out_statuses, out_parents) =
-        remove_interstitial_nodes(&final_geoms, &final_statuses, &final_parents);
-    (out_geoms, out_statuses, out_parents)
+    remove_interstitial_nodes(final_geoms, final_statuses, final_parents)
 }
 
 /// Query R-tree for line indices near a polygon's bounding box.

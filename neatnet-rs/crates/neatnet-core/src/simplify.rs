@@ -38,7 +38,12 @@ pub fn neatify(
     // Step 1: Fix topology
     let t_step = Instant::now();
     let (fixed_geoms, fixed_statuses, fixed_parents) =
-        nodes::fix_topology(&network.geometries, &network.statuses, &network.parent_ids, params.eps);
+        nodes::fix_topology(
+            std::mem::take(&mut network.geometries),
+            std::mem::take(&mut network.statuses),
+            std::mem::take(&mut network.parent_ids),
+            params.eps,
+        );
     network.geometries = fixed_geoms;
     network.statuses = fixed_statuses;
     network.parent_ids = fixed_parents;
@@ -194,10 +199,14 @@ fn neatify_loop(
         }
     }
 
-    let (cleaned, statuses, cleaned_parents) =
-        nodes::remove_interstitial_nodes(&network.geometries, &network.statuses, &network.parent_ids);
+    let (cleaned, clean_statuses, cleaned_parents) =
+        nodes::remove_interstitial_nodes(
+            std::mem::take(&mut network.geometries),
+            std::mem::take(&mut network.statuses),
+            std::mem::take(&mut network.parent_ids),
+        );
     network.geometries = cleaned;
-    network.statuses = statuses;
+    network.statuses = clean_statuses;
     network.parent_ids = cleaned_parents;
     log::info!("  [loop] remove_dangles + clean: {:.3}s (dropped {}, {} edges remain)", t_step.elapsed().as_secs_f64(), n_dangles, network.geometries.len());
 
@@ -550,10 +559,14 @@ fn neatify_pairs(
         }
 
         // Clean topology after drops
-        let (cleaned, statuses, cleaned_parents) =
-            nodes::remove_interstitial_nodes(&network.geometries, &network.statuses, &network.parent_ids);
+        let (cleaned, clean_statuses, cleaned_parents) =
+            nodes::remove_interstitial_nodes(
+                std::mem::take(&mut network.geometries),
+                std::mem::take(&mut network.statuses),
+                std::mem::take(&mut network.parent_ids),
+            );
         network.geometries = cleaned;
-        network.statuses = statuses;
+        network.statuses = clean_statuses;
         network.parent_ids = cleaned_parents;
     }
 
@@ -632,10 +645,10 @@ fn neatify_clusters(
     // Build R-tree once for all cluster lookups
     let tree = crate::spatial::build_rtree(&network.geometries);
 
-    // Process clusters in parallel — each cluster only reads shared data
-    // (network.geometries, artifact_geoms, tree) and produces independent results.
-    use rayon::prelude::*;
-
+    // Process clusters sequentially to limit peak memory — each cluster's
+    // buffer()/relate() allocations are freed before the next starts.
+    // Inner parallelism in find_covered/find_boundary (par_iter on candidates)
+    // still uses all cores within each cluster.
     let eligible_clusters: Vec<&Vec<usize>> = sorted_cluster_labels
         .iter()
         .filter_map(|label| {
@@ -645,62 +658,46 @@ fn neatify_clusters(
         .collect();
 
     let t_clusters = Instant::now();
-    let cluster_results: Vec<(Vec<usize>, Vec<LineString<f64>>)> = eligible_clusters
-        .par_iter()
-        .map(|cluster| {
-            // Merge all artifact polygons in the cluster
-            let mut merged: MultiPolygon<f64> = MultiPolygon(vec![artifact_geoms[cluster[0]].clone()]);
-            for &i in &cluster[1..] {
-                merged = merged.union(&MultiPolygon(vec![artifact_geoms[i].clone()]));
+    for cluster in &eligible_clusters {
+        // Merge all artifact polygons in the cluster
+        let mut merged: MultiPolygon<f64> = MultiPolygon(vec![artifact_geoms[cluster[0]].clone()]);
+        for &i in &cluster[1..] {
+            merged = merged.union(&MultiPolygon(vec![artifact_geoms[i].clone()]));
+        }
+
+        if merged.0.is_empty() {
+            continue;
+        }
+
+        for merged_poly in &merged.0 {
+            let covered = find_covered_edges_with_tree(&network.geometries, &tree, merged_poly, params.eps);
+            if covered.is_empty() {
+                continue;
             }
 
-            if merged.0.is_empty() {
-                return (vec![], vec![]);
+            let boundary_edges =
+                find_boundary_edges_with_tree(&network.geometries, &tree, merged_poly, params.eps);
+            if boundary_edges.is_empty() {
+                to_drop.extend(&covered);
+                continue;
             }
 
-            let mut all_covered: Vec<usize> = Vec::new();
-            let mut all_cleaned: Vec<LineString<f64>> = Vec::new();
-
-            for merged_poly in &merged.0 {
-                let covered = find_covered_edges_with_tree(&network.geometries, &tree, merged_poly, params.eps);
-                if covered.is_empty() {
-                    continue;
-                }
-
-                let boundary_edges =
-                    find_boundary_edges_with_tree(&network.geometries, &tree, merged_poly, params.eps);
-                if boundary_edges.is_empty() {
-                    all_covered.extend(&covered);
-                    continue;
-                }
-
-                let boundary_geoms: Vec<LineString<f64>> = boundary_edges
-                    .iter()
-                    .map(|&i| network.geometries[i].clone())
-                    .collect();
-                let (skel, _) = geometry::voronoi_skeleton(
-                    &boundary_geoms,
-                    Some(merged_poly),
-                    None,
-                    params.max_segment_length,
-                    None,
-                    None,
-                    params.clip_limit,
-                    Some(params.consolidation_tolerance),
-                );
-                all_covered.extend(&covered);
-                all_cleaned.extend(skel);
-            }
-
-            (all_covered, all_cleaned)
-        })
-        .collect();
-
-    // Merge results from all clusters
-    for (covered, cleaned) in cluster_results {
-        if !covered.is_empty() {
-            to_drop.extend(covered);
-            to_add.extend(cleaned);
+            let boundary_geoms: Vec<LineString<f64>> = boundary_edges
+                .iter()
+                .map(|&i| network.geometries[i].clone())
+                .collect();
+            let (skel, _) = geometry::voronoi_skeleton(
+                &boundary_geoms,
+                Some(merged_poly),
+                None,
+                params.max_segment_length,
+                None,
+                None,
+                params.clip_limit,
+                Some(params.consolidation_tolerance),
+            );
+            to_drop.extend(&covered);
+            to_add.extend(skel);
         }
     }
     log::info!("    [clusters] {} clusters processed in {:.3}s", eligible_clusters.len(), t_clusters.elapsed().as_secs_f64());
@@ -1476,23 +1473,41 @@ fn apply_changes(
         let merged_adds = merge_and_explode(to_add);
         let deduped = dedup_geometries(&merged_adds);
         let simp_eps = params.max_segment_length * params.simplification_factor;
-        for geom in deduped {
-            let simplified = geom.simplify(simp_eps);
-            // Filter degenerate edges (zero-length or near-zero after simplify)
-            if simplified.0.len() >= 2 && Euclidean.length(&simplified) > params.eps {
-                network.geometries.push(simplified);
-                network.statuses.push(EdgeStatus::New);
-                // New skeleton edges inherit the union of ALL dropped edges' parent_ids
+        // Collect valid edges first, then share parent_ids (move last, clone rest)
+        let valid_edges: Vec<LineString<f64>> = deduped
+            .into_iter()
+            .filter_map(|geom| {
+                let simplified = geom.simplify(simp_eps);
+                if simplified.0.len() >= 2 && Euclidean.length(&simplified) > params.eps {
+                    Some(simplified)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let n_valid = valid_edges.len();
+        for (j, simplified) in valid_edges.into_iter().enumerate() {
+            network.geometries.push(simplified);
+            network.statuses.push(EdgeStatus::New);
+            // Move the last one, clone the rest
+            if j + 1 == n_valid {
+                network.parent_ids.push(dropped_parents);
+                break;
+            } else {
                 network.parent_ids.push(dropped_parents.clone());
             }
         }
     }
 
     // Clean topology after changes
-    let (cleaned, statuses, cleaned_parents) =
-        nodes::remove_interstitial_nodes(&network.geometries, &network.statuses, &network.parent_ids);
+    let (cleaned, clean_statuses, cleaned_parents) =
+        nodes::remove_interstitial_nodes(
+            std::mem::take(&mut network.geometries),
+            std::mem::take(&mut network.statuses),
+            std::mem::take(&mut network.parent_ids),
+        );
     network.geometries = cleaned;
-    network.statuses = statuses;
+    network.statuses = clean_statuses;
     network.parent_ids = cleaned_parents;
 }
 
@@ -1547,8 +1562,8 @@ fn dedup_network(network: &mut StreetNetwork) {
     let mut new_geoms = Vec::new();
     let mut new_statuses = Vec::new();
     let mut new_parents = Vec::new();
-    for (i, (geom, &status)) in network.geometries.iter().zip(network.statuses.iter()).enumerate() {
-        let normalized = ops::normalize_linestring(geom);
+    for i in 0..network.geometries.len() {
+        let normalized = ops::normalize_linestring(&network.geometries[i]);
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         normalized.0.len().hash(&mut hasher);
         for c in &normalized.0 {
@@ -1567,9 +1582,10 @@ fn dedup_network(network: &mut StreetNetwork) {
             survivor_parents.sort_unstable();
         } else {
             seen.insert(hash, new_geoms.len());
-            new_geoms.push(geom.clone());
-            new_statuses.push(status);
-            new_parents.push(network.parent_ids[i].clone());
+            // Move instead of clone — zero allocation
+            new_geoms.push(std::mem::replace(&mut network.geometries[i], LineString::new(vec![])));
+            new_statuses.push(network.statuses[i]);
+            new_parents.push(std::mem::take(&mut network.parent_ids[i]));
         }
     }
     network.geometries = new_geoms;

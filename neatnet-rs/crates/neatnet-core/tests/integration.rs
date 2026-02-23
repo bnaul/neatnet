@@ -94,13 +94,14 @@ fn test_apalachicola_topology_only() {
     assert_eq!(geoms.len(), 1782);
 
     let n = geoms.len();
+    let orig_length: f64 = geoms.iter().map(|g| Euclidean.length(g)).sum();
     let statuses = vec![EdgeStatus::Original; n];
     let parent_ids: Vec<Vec<usize>> = (0..n).map(|i| vec![i]).collect();
     let params = NeatifyParams::default();
 
     // Step 1: Fix topology
     let (fixed_geoms, fixed_statuses, fixed_parents) =
-        neatnet_core::nodes::fix_topology(&geoms, &statuses, &parent_ids, params.eps);
+        neatnet_core::nodes::fix_topology(geoms, statuses, parent_ids, params.eps);
 
     println!("After fix_topology: {} edges", fixed_geoms.len());
     // fix_topology merges degree-2 chains via remove_interstitial_nodes,
@@ -126,11 +127,6 @@ fn test_apalachicola_topology_only() {
         .map(|g| Euclidean.length(g))
         .sum();
     println!("Total length after topology: {:.2}", total_length);
-
-    // Length should be approximately preserved (within 5%)
-    let orig_length: f64 = geoms.iter()
-        .map(|g| Euclidean.length(g))
-        .sum();
     let ratio = total_length / orig_length;
     println!("Length ratio after topology: {:.3}", ratio);
     // TODO: fix_topology currently loses ~50% of length due to
@@ -178,7 +174,7 @@ fn test_apalachicola_fix_topology_steps() {
         induced.len(), induced_len, induced_len / orig_length);
 
     // Step 3: Remove interstitial
-    let (cleaned, _, _) = nodes::remove_interstitial_nodes(&induced, &induced_st, &induced_parents);
+    let (cleaned, _, _) = nodes::remove_interstitial_nodes(induced, induced_st, induced_parents);
     let cleaned_len: f64 = cleaned.iter().map(|g| Euclidean.length(g)).sum();
     println!("After remove_interstitial: {} edges, length {:.2} (ratio {:.3})",
         cleaned.len(), cleaned_len, cleaned_len / orig_length);
@@ -197,7 +193,7 @@ fn test_apalachicola_pipeline_steps() {
     println!("  Edges: {}", geoms.len());
 
     // Step 1: Fix topology
-    let (fixed, fixed_st, fixed_parents) = nodes::fix_topology(&geoms, &statuses, &parent_ids, params.eps);
+    let (fixed, fixed_st, fixed_parents) = nodes::fix_topology(geoms, statuses, parent_ids, params.eps);
     println!("=== Step 1: fix_topology ===");
     println!("  Edges: {}", fixed.len());
 
