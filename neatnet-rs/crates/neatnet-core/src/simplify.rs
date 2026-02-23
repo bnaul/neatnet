@@ -132,19 +132,18 @@ pub fn neatify(
     // Final cleanup: remove degenerate edges (zero-length or near-zero)
     // that may have been produced by consolidation, topology fixing, or
     // skeleton generation. Python's GEOS operations implicitly filter these.
-    let mut clean_geoms = Vec::new();
-    let mut clean_statuses = Vec::new();
-    let mut clean_parents = Vec::new();
-    for ((geom, &status), parents) in network.geometries.iter().zip(network.statuses.iter()).zip(network.parent_ids.iter()) {
-        if geom.0.len() >= 2 && Euclidean.length(geom) > params.eps {
-            clean_geoms.push(geom.clone());
-            clean_statuses.push(status);
-            clean_parents.push(parents.clone());
+    // Remove in-place to avoid cloning all surviving geometries.
+    let eps = params.eps;
+    let mut i = 0;
+    while i < network.geometries.len() {
+        if network.geometries[i].0.len() < 2 || Euclidean.length(&network.geometries[i]) <= eps {
+            network.geometries.swap_remove(i);
+            network.statuses.swap_remove(i);
+            network.parent_ids.swap_remove(i);
+        } else {
+            i += 1;
         }
     }
-    network.geometries = clean_geoms;
-    network.statuses = clean_statuses;
-    network.parent_ids = clean_parents;
 
     Ok(())
 }
@@ -181,20 +180,18 @@ fn neatify_loop(
         }
     }
 
+    let n_dangles = dangle_indices.len();
     if !dangle_indices.is_empty() {
-        let mut new_geoms = Vec::new();
-        let mut new_statuses = Vec::new();
-        let mut new_parents = Vec::new();
-        for (i, geom) in network.geometries.iter().enumerate() {
-            if !dangle_indices.contains(&i) {
-                new_geoms.push(geom.clone());
-                new_statuses.push(network.statuses[i]);
-                new_parents.push(network.parent_ids[i].clone());
+        // Remove in-place via swap_remove in reverse sorted order
+        let mut sorted_dangles: Vec<usize> = dangle_indices.into_iter().collect();
+        sorted_dangles.sort_unstable();
+        for &i in sorted_dangles.iter().rev() {
+            if i < network.geometries.len() {
+                network.geometries.swap_remove(i);
+                network.statuses.swap_remove(i);
+                network.parent_ids.swap_remove(i);
             }
         }
-        network.geometries = new_geoms;
-        network.statuses = new_statuses;
-        network.parent_ids = new_parents;
     }
 
     let (cleaned, statuses, cleaned_parents) =
@@ -202,7 +199,7 @@ fn neatify_loop(
     network.geometries = cleaned;
     network.statuses = statuses;
     network.parent_ids = cleaned_parents;
-    log::info!("  [loop] remove_dangles + clean: {:.3}s (dropped {}, {} edges remain)", t_step.elapsed().as_secs_f64(), dangle_indices.len(), network.geometries.len());
+    log::info!("  [loop] remove_dangles + clean: {:.3}s (dropped {}, {} edges remain)", t_step.elapsed().as_secs_f64(), n_dangles, network.geometries.len());
 
     // 2. Build contiguity graph on artifacts → classify as singles/pairs/clusters
     let t_step = Instant::now();
@@ -292,12 +289,6 @@ fn neatify_singletons(
     // Build R-tree once for all singleton lookups
     let tree = crate::spatial::build_rtree(&network.geometries);
 
-    // Pre-buffer all referenced artifacts to avoid recomputing per query
-    let artifact_buffers: Vec<MultiPolygon<f64>> = artifact_indices
-        .iter()
-        .map(|&i| artifact_geoms[i].buffer(params.eps))
-        .collect();
-
     let mut to_drop: Vec<usize> = Vec::new();
     let mut to_add: Vec<LineString<f64>> = Vec::new();
 
@@ -305,9 +296,10 @@ fn neatify_singletons(
         let artifact = &artifact_geoms[art_idx];
         let ces = &ces_info[local_idx];
 
-        // Find edges covered by this artifact (using pre-computed buffer)
+        // Compute buffer lazily per artifact to avoid keeping all buffers alive at once
+        let artifact_buf = artifact.buffer(params.eps);
         let covered_edges = find_covered_edges_buffered(
-            &network.geometries, &tree, artifact, &artifact_buffers[local_idx],
+            &network.geometries, &tree, artifact, &artifact_buf,
         );
         if covered_edges.is_empty() {
             continue;
@@ -441,13 +433,9 @@ fn neatify_pairs(
     let tree = crate::spatial::build_rtree(&network.geometries);
 
     // Pre-buffer all referenced artifacts
-    let artifact_buffers: HashMap<usize, MultiPolygon<f64>> = artifact_indices
-        .iter()
-        .map(|&i| (i, artifact_geoms[i].buffer(params.eps)))
-        .collect();
-
     // Non-planar detection: stroke_count > node_count
     // (mirrors Python _identify_non_planar)
+    // Compute buffers lazily per artifact to avoid all buffers alive at once.
     let singleton_geoms: Vec<Polygon<f64>> = artifact_indices
         .iter()
         .map(|&i| artifact_geoms[i].clone())
@@ -457,8 +445,9 @@ fn neatify_pairs(
     let mut non_planar: HashSet<usize> = HashSet::new();
     for (local_idx, &art_idx) in artifact_indices.iter().enumerate() {
         let artifact = &artifact_geoms[art_idx];
+        let buf = artifact.buffer(params.eps);
         let covered = find_covered_edges_buffered(
-            &network.geometries, &tree, artifact, &artifact_buffers[&art_idx],
+            &network.geometries, &tree, artifact, &buf,
         );
         let covered_geoms: Vec<LineString<f64>> = covered.iter().map(|&i| network.geometries[i].clone()).collect();
         let (node_coords, _) = nodes::nodes_from_edges(&covered_geoms);
@@ -495,12 +484,14 @@ fn neatify_pairs(
             continue;
         }
 
-        // Find edges covered by each artifact (using pre-computed buffers)
+        // Find edges covered by each artifact (compute buffers per-pair)
+        let buf_a = artifact_geoms[pair[0]].buffer(params.eps);
+        let buf_b = artifact_geoms[pair[1]].buffer(params.eps);
         let covered_a = find_covered_edges_buffered(
-            &network.geometries, &tree, &artifact_geoms[pair[0]], &artifact_buffers[&pair[0]],
+            &network.geometries, &tree, &artifact_geoms[pair[0]], &buf_a,
         );
         let covered_b = find_covered_edges_buffered(
-            &network.geometries, &tree, &artifact_geoms[pair[1]], &artifact_buffers[&pair[1]],
+            &network.geometries, &tree, &artifact_geoms[pair[1]], &buf_b,
         );
         let set_a: HashSet<usize> = covered_a.iter().copied().collect();
         let set_b: HashSet<usize> = covered_b.iter().copied().collect();
@@ -547,24 +538,16 @@ fn neatify_pairs(
             .iter()
             .map(|(_, shared_idx)| *shared_idx)
             .collect();
-        let mut new_geoms = Vec::new();
-        let mut new_statuses = Vec::new();
-        let mut new_parents = Vec::new();
-        // Build index mapping: old → new
-        let mut idx_map: Vec<Option<usize>> = vec![None; network.geometries.len()];
-        let mut new_idx = 0;
-        for (i, geom) in network.geometries.iter().enumerate() {
-            if !drop_indices.contains(&i) {
-                idx_map[i] = Some(new_idx);
-                new_geoms.push(geom.clone());
-                new_statuses.push(network.statuses[i]);
-                new_parents.push(network.parent_ids[i].clone());
-                new_idx += 1;
+        // Remove in-place via swap_remove in reverse sorted order
+        let mut sorted_drops: Vec<usize> = drop_indices.into_iter().collect();
+        sorted_drops.sort_unstable();
+        for &i in sorted_drops.iter().rev() {
+            if i < network.geometries.len() {
+                network.geometries.swap_remove(i);
+                network.statuses.swap_remove(i);
+                network.parent_ids.swap_remove(i);
             }
         }
-        network.geometries = new_geoms;
-        network.statuses = new_statuses;
-        network.parent_ids = new_parents;
 
         // Clean topology after drops
         let (cleaned, statuses, cleaned_parents) =
@@ -1475,15 +1458,16 @@ fn apply_changes(
     dropped_parents.sort_unstable();
     dropped_parents.dedup();
 
-    let mut new_geoms = Vec::new();
-    let mut new_statuses = Vec::new();
-    let mut new_parents = Vec::new();
-
-    for (i, geom) in network.geometries.iter().enumerate() {
-        if !drop_set.contains(&i) {
-            new_geoms.push(geom.clone());
-            new_statuses.push(network.statuses[i]);
-            new_parents.push(network.parent_ids[i].clone());
+    // Remove dropped edges in-place using swap_remove pattern to avoid
+    // cloning all surviving geometries. We collect indices to remove in
+    // reverse order so swap_remove doesn't invalidate earlier indices.
+    let mut sorted_drops: Vec<usize> = drop_set.iter().copied().collect();
+    sorted_drops.sort_unstable();
+    for &i in sorted_drops.iter().rev() {
+        if i < network.geometries.len() {
+            network.geometries.swap_remove(i);
+            network.statuses.swap_remove(i);
+            network.parent_ids.swap_remove(i);
         }
     }
 
@@ -1496,17 +1480,13 @@ fn apply_changes(
             let simplified = geom.simplify(simp_eps);
             // Filter degenerate edges (zero-length or near-zero after simplify)
             if simplified.0.len() >= 2 && Euclidean.length(&simplified) > params.eps {
-                new_geoms.push(simplified);
-                new_statuses.push(EdgeStatus::New);
+                network.geometries.push(simplified);
+                network.statuses.push(EdgeStatus::New);
                 // New skeleton edges inherit the union of ALL dropped edges' parent_ids
-                new_parents.push(dropped_parents.clone());
+                network.parent_ids.push(dropped_parents.clone());
             }
         }
     }
-
-    network.geometries = new_geoms;
-    network.statuses = new_statuses;
-    network.parent_ids = new_parents;
 
     // Clean topology after changes
     let (cleaned, statuses, cleaned_parents) =

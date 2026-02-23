@@ -119,8 +119,10 @@ pub fn voronoi_skeleton(
     let buffer_boundary = buffer_geom.exterior().clone();
 
     // 2. Extract points from segmentized lines
-    let mut points: Vec<[f64; 2]> = Vec::new();
-    let mut point_line_ids: Vec<usize> = Vec::new();
+    // Estimate capacity: each line has ~length/msl vertices after segmentization
+    let est_points: usize = lines.iter().map(|l| l.0.len().max(2) * 2).sum();
+    let mut points: Vec<[f64; 2]> = Vec::with_capacity(est_points);
+    let mut point_line_ids: Vec<usize> = Vec::with_capacity(est_points);
 
     for (line_idx, line) in lines.iter().enumerate() {
         let segmentized = segmentize(line, max_segment_length);
@@ -141,17 +143,17 @@ pub fn voronoi_skeleton(
         point_line_ids.push(buffer_line_id);
     }
 
-    // 3. Remove duplicate points
-    let (unique_points, unique_ids) = deduplicate_points(&points, &point_line_ids);
-    if unique_points.len() < 3 {
+    // 3. Remove duplicate points and build Delaunay input in one pass
+    let (del_points, unique_ids) = deduplicate_to_delaunay(&points, &point_line_ids);
+    // Drop the raw points+ids — no longer needed.
+    drop(points);
+    drop(point_line_ids);
+
+    if del_points.len() < 3 {
         return (vec![], vec![]);
     }
 
     // 4. Build Delaunay triangulation
-    let del_points: Vec<delaunator::Point> = unique_points
-        .iter()
-        .map(|p| delaunator::Point { x: p[0], y: p[1] })
-        .collect();
     let triangulation = delaunator::triangulate(&del_points);
 
     // 5. Extract ridges between different input lines
@@ -312,26 +314,28 @@ fn extract_2pt_coords(geom: &LineString<f64>) -> Option<([f64; 2], [f64; 2])> {
     Some((a, b))
 }
 
-fn deduplicate_points(
+/// Deduplicate points and convert directly to delaunator::Point in one pass,
+/// avoiding an intermediate Vec<[f64; 2]> copy.
+fn deduplicate_to_delaunay(
     points: &[[f64; 2]],
     ids: &[usize],
-) -> (Vec<[f64; 2]>, Vec<usize>) {
-    let mut counts: HashMap<(u64, u64), usize> = HashMap::new();
+) -> (Vec<delaunator::Point>, Vec<usize>) {
+    let mut counts: HashMap<(u64, u64), usize> = HashMap::with_capacity(points.len());
     for p in points {
         let key = (p[0].to_bits(), p[1].to_bits());
         *counts.entry(key).or_default() += 1;
     }
 
-    let mut unique_points = Vec::new();
-    let mut unique_ids = Vec::new();
+    let mut del_points = Vec::with_capacity(points.len());
+    let mut unique_ids = Vec::with_capacity(points.len());
     for (p, &id) in points.iter().zip(ids.iter()) {
         let key = (p[0].to_bits(), p[1].to_bits());
         if counts[&key] == 1 {
-            unique_points.push(*p);
+            del_points.push(delaunator::Point { x: p[0], y: p[1] });
             unique_ids.push(id);
         }
     }
-    (unique_points, unique_ids)
+    (del_points, unique_ids)
 }
 
 /// Build a LineString connecting the nearest points of two LineStrings.

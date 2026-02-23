@@ -25,13 +25,19 @@ hashbrown = { workspace = true }
 # Optional deps for CLI binary
 parquet = { workspace = true, optional = true }
 env_logger = { workspace = true, optional = true }
+dhat = { workspace = true, optional = true }
 
 [features]
 cli = ["dep:parquet", "dep:env_logger"]
+dhat-heap = ["dep:dhat", "cli"]
 
 [[bin]]
 name = "profile_neatify"
 required-features = ["cli"]
+
+[[bin]]
+name = "profile_memory"
+required-features = ["dhat-heap"]
 
 [dev-dependencies]
 approx = "0.5"

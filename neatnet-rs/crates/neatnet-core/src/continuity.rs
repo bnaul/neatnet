@@ -143,6 +143,9 @@ pub fn coins(geometries: &[LineString<f64>], angle_threshold: f64) -> CoinsResul
     }
 
     // 5. Merge by chain-walking.
+    // Use seg_to_group itself as the visited marker: Some(_) means already assigned.
+    // This avoids allocating a fresh vec![false; n_segs] per stroke group walk,
+    // which was O(groups * segments) total allocation.
     let mut seg_to_group: Vec<Option<usize>> = vec![None; n_segs];
     let mut next_group = 0usize;
 
@@ -150,18 +153,19 @@ pub fn coins(geometries: &[LineString<f64>], angle_threshold: f64) -> CoinsResul
         if seg_to_group[start].is_some() {
             continue;
         }
+        // Temporarily mark start as visited by assigning a sentinel group.
+        // We'll overwrite with the real group ID at the end.
+        seg_to_group[start] = Some(usize::MAX);
         let mut group_members = vec![start];
-        let mut visited = vec![false; n_segs];
-        visited[start] = true;
 
         let mut current = start;
         loop {
             let next = p1_final[current]
-                .filter(|&p| !visited[p])
-                .or_else(|| p2_final[current].filter(|&p| !visited[p]));
+                .filter(|&p| seg_to_group[p].is_none())
+                .or_else(|| p2_final[current].filter(|&p| seg_to_group[p].is_none()));
             match next {
                 Some(n) => {
-                    visited[n] = true;
+                    seg_to_group[n] = Some(usize::MAX);
                     group_members.push(n);
                     current = n;
                 }
@@ -172,11 +176,11 @@ pub fn coins(geometries: &[LineString<f64>], angle_threshold: f64) -> CoinsResul
         current = start;
         loop {
             let next = p2_final[current]
-                .filter(|&p| !visited[p])
-                .or_else(|| p1_final[current].filter(|&p| !visited[p]));
+                .filter(|&p| seg_to_group[p].is_none())
+                .or_else(|| p1_final[current].filter(|&p| seg_to_group[p].is_none()));
             match next {
                 Some(n) => {
-                    visited[n] = true;
+                    seg_to_group[n] = Some(usize::MAX);
                     group_members.push(n);
                     current = n;
                 }
