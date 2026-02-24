@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "neatnet-rs"
-version = "0.1.4"
+version = "0.1.5"
 description = "Street network simplification (Rust-accelerated)"
 requires-python = ">=3.11"
 license = "BSD-3-Clause"
