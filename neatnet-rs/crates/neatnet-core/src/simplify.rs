@@ -35,6 +35,27 @@ pub fn neatify(
     params: &NeatifyParams,
     exclusion_mask: Option<&[Polygon<f64>]>,
 ) -> Result<(), NeatifyError> {
+    // Cap rayon thread count to limit memory from concurrent geo::Relate
+    // calls (each builds temporary R-trees). On machines with many cores
+    // (e.g. 64), uncapped parallelism can use 100+ GB of RAM.
+    const MAX_THREADS: usize = 8;
+    let n_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let n_threads = n_cpus.min(MAX_THREADS);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(n_threads)
+        .build()
+        .expect("failed to build rayon thread pool");
+    log::info!("[neatify] using {} threads (machine has {})", n_threads, n_cpus);
+    pool.install(|| neatify_inner(network, params, exclusion_mask))
+}
+
+fn neatify_inner(
+    network: &mut StreetNetwork,
+    params: &NeatifyParams,
+    exclusion_mask: Option<&[Polygon<f64>]>,
+) -> Result<(), NeatifyError> {
     // Step 1: Fix topology
     let t_step = Instant::now();
     let (fixed_geoms, fixed_statuses, fixed_parents) =
