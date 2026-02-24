@@ -1,6 +1,10 @@
 //! Standalone profiling binary for neatify pipeline.
 //! Usage: cargo run --release --features cli --bin profile_neatify -- /path/to/edges.[wkt|parquet] [n_loops]
 
+#[cfg(not(feature = "dhat-heap"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::fs;
 use std::path::Path;
 use std::time::Instant;

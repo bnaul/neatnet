@@ -248,8 +248,11 @@ pub fn induce_nodes(
         return (vec![], vec![], vec![]);
     }
 
-    let mismatch_points = identify_degree_mismatch(geometries, eps);
-    let (loop_non_loop_pts, loop_loop_pts) = makes_loop_contact(geometries, eps);
+    // Build one R-tree and share it across all three helpers
+    let shared_tree = crate::spatial::build_rtree(geometries);
+
+    let mismatch_points = identify_degree_mismatch(geometries, eps, &shared_tree);
+    let (loop_non_loop_pts, loop_loop_pts) = makes_loop_contact(geometries, eps, &shared_tree);
 
     let mut all_split_points: Vec<Coord<f64>> = Vec::new();
     let mut seen_keys = std::collections::HashSet::new();
@@ -268,17 +271,60 @@ pub fn induce_nodes(
         return (geometries.to_vec(), statuses.to_vec(), parent_ids.to_vec());
     }
 
-    split_edges_at_points(geometries, statuses, parent_ids, &all_split_points, eps)
+    split_edges_at_points(geometries, statuses, parent_ids, &all_split_points, eps, &shared_tree)
 }
 
-fn identify_degree_mismatch(geometries: &[LineString<f64>], eps: f64) -> Vec<Coord<f64>> {
+/// Like `induce_nodes` but takes ownership of the input vectors.
+///
+/// When no splits are needed, returns the original data without cloning.
+/// This avoids the peak memory spike of briefly holding two copies of all
+/// geometries that occurs with the borrowing version.
+pub fn induce_nodes_owned(
+    geometries: Vec<LineString<f64>>,
+    statuses: Vec<EdgeStatus>,
+    parent_ids: Vec<Vec<usize>>,
+    eps: f64,
+) -> (Vec<LineString<f64>>, Vec<EdgeStatus>, Vec<Vec<usize>>) {
+    if geometries.is_empty() {
+        return (geometries, statuses, parent_ids);
+    }
+
+    let shared_tree = crate::spatial::build_rtree(&geometries);
+
+    let mismatch_points = identify_degree_mismatch(&geometries, eps, &shared_tree);
+    let (loop_non_loop_pts, loop_loop_pts) = makes_loop_contact(&geometries, eps, &shared_tree);
+
+    let mut all_split_points: Vec<Coord<f64>> = Vec::new();
+    let mut seen_keys = std::collections::HashSet::new();
+
+    for pt in mismatch_points.iter()
+        .chain(loop_non_loop_pts.iter())
+        .chain(loop_loop_pts.iter())
+    {
+        let key = node_key(pt.x, pt.y);
+        if seen_keys.insert(key) {
+            all_split_points.push(*pt);
+        }
+    }
+
+    if all_split_points.is_empty() {
+        return (geometries, statuses, parent_ids);
+    }
+
+    split_edges_at_points(&geometries, &statuses, &parent_ids, &all_split_points, eps, &shared_tree)
+}
+
+fn identify_degree_mismatch(
+    geometries: &[LineString<f64>],
+    eps: f64,
+    geom_tree: &RTree<crate::spatial::IndexedEnvelope>,
+) -> Vec<Coord<f64>> {
     let (node_coords, degrees) = nodes_from_edges(geometries);
-    let geom_tree = crate::spatial::build_rtree(geometries);
 
     let mut result = Vec::new();
     for (i, coord) in node_coords.iter().enumerate() {
         let candidates = crate::spatial::query_envelope(
-            &geom_tree,
+            geom_tree,
             [coord[0] - eps, coord[1] - eps],
             [coord[0] + eps, coord[1] + eps],
         );
@@ -302,65 +348,55 @@ fn identify_degree_mismatch(geometries: &[LineString<f64>], eps: f64) -> Vec<Coo
 fn makes_loop_contact(
     geometries: &[LineString<f64>],
     eps: f64,
+    geom_tree: &RTree<crate::spatial::IndexedEnvelope>,
 ) -> (Vec<Coord<f64>>, Vec<Coord<f64>>) {
-    let mut loop_indices = Vec::new();
-    let mut non_loop_indices = Vec::new();
+    let mut loop_set = std::collections::HashSet::new();
+    let mut has_loops = false;
 
     for (i, geom) in geometries.iter().enumerate() {
         if geom.0.len() >= 4 && geom.0[0] == geom.0[geom.0.len() - 1] {
-            loop_indices.push(i);
-        } else {
-            non_loop_indices.push(i);
+            loop_set.insert(i);
+            has_loops = true;
         }
     }
 
-    if loop_indices.is_empty() {
+    if !has_loops {
         return (vec![], vec![]);
     }
-
-    let non_loop_geoms: Vec<LineString<f64>> = non_loop_indices.iter().map(|&i| geometries[i].clone()).collect();
-    let non_loop_tree = crate::spatial::build_rtree(&non_loop_geoms);
-
-    let loop_geoms: Vec<LineString<f64>> = loop_indices.iter().map(|&i| geometries[i].clone()).collect();
-    let loop_tree = crate::spatial::build_rtree(&loop_geoms);
 
     let mut non_loop_contact = Vec::new();
     let mut loop_contact = Vec::new();
 
-    for &li in &loop_indices {
+    for &li in &loop_set {
         let coords = &geometries[li].0;
         for vi in 0..coords.len() {
             let c = coords[vi];
             let pt = Point::new(c.x, c.y);
 
-            // Check non-loop contact
-            let nl_candidates = crate::spatial::query_envelope(
-                &non_loop_tree,
+            let candidates = crate::spatial::query_envelope(
+                geom_tree,
                 [c.x - eps, c.y - eps],
                 [c.x + eps, c.y + eps],
             );
-            for &idx in &nl_candidates {
-                let dist = Euclidean.distance(&pt, &non_loop_geoms[idx]);
+
+            let mut touches_non_loop = false;
+            let mut loop_touch_count = 0;
+
+            for &idx in &candidates {
+                let dist = Euclidean.distance(&pt, &geometries[idx]);
                 if dist <= eps {
-                    non_loop_contact.push(c);
-                    break;
+                    if loop_set.contains(&idx) {
+                        loop_touch_count += 1;
+                    } else {
+                        touches_non_loop = true;
+                    }
                 }
             }
 
-            // Check loop-loop contact
-            let l_candidates = crate::spatial::query_envelope(
-                &loop_tree,
-                [c.x - eps, c.y - eps],
-                [c.x + eps, c.y + eps],
-            );
-            let mut touch_count = 0;
-            for &idx in &l_candidates {
-                let dist = Euclidean.distance(&pt, &loop_geoms[idx]);
-                if dist <= eps {
-                    touch_count += 1;
-                }
+            if touches_non_loop {
+                non_loop_contact.push(c);
             }
-            if touch_count > 1 {
+            if loop_touch_count > 1 {
                 loop_contact.push(c);
             }
         }
@@ -375,18 +411,17 @@ fn split_edges_at_points(
     parent_ids: &[Vec<usize>],
     split_points: &[Coord<f64>],
     eps: f64,
+    tree: &RTree<crate::spatial::IndexedEnvelope>,
 ) -> (Vec<LineString<f64>>, Vec<EdgeStatus>, Vec<Vec<usize>>) {
     if split_points.is_empty() {
         return (geometries.to_vec(), statuses.to_vec(), parent_ids.to_vec());
     }
 
-    // Build R-tree ONCE and collect all split points per edge
-    let tree = crate::spatial::build_rtree(geometries);
     let mut edge_split_points: HashMap<usize, Vec<Coord<f64>>> = HashMap::new();
 
     for split_pt in split_points {
         let candidates = crate::spatial::query_envelope(
-            &tree,
+            tree,
             [split_pt.x - eps * 10.0, split_pt.y - eps * 10.0],
             [split_pt.x + eps * 10.0, split_pt.y + eps * 10.0],
         );
@@ -877,6 +912,25 @@ pub fn envelope_query_indices_pub(
     poly: &Polygon<f64>,
 ) -> Vec<usize> {
     envelope_query_indices(tree, poly)
+}
+
+/// Query R-tree for line indices near a polygon's bounding box, expanded by a margin.
+///
+/// This is needed for distance-based checks where edges within `margin` of the
+/// polygon may not overlap the polygon's exact bounding box.
+pub fn envelope_query_indices_expanded(
+    tree: &rstar::RTree<crate::spatial::IndexedEnvelope>,
+    poly: &Polygon<f64>,
+    margin: f64,
+) -> Vec<usize> {
+    match poly.bounding_rect() {
+        Some(rect) => crate::spatial::query_envelope(
+            tree,
+            [rect.min().x - margin, rect.min().y - margin],
+            [rect.max().x + margin, rect.max().y + margin],
+        ),
+        None => vec![],
+    }
 }
 
 fn envelope_query_indices(

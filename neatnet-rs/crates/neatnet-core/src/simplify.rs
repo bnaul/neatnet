@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
-use geo::{Area, BooleanOps, BoundingRect, Buffer, Centroid, Contains, Distance, Euclidean, Intersects, Length, Relate, Simplify};
+use geo::{Area, BooleanOps, BoundingRect, Centroid, Contains, Distance, Euclidean, Intersects, Length, Relate, Simplify};
 use geo_types::{Coord, LineString, MultiPolygon, Point, Polygon};
 
 use crate::artifacts;
@@ -100,17 +100,27 @@ pub fn neatify(
         neatify_loop(network, &current_artifacts, params)?;
         log::info!("[neatify] loop {}: neatify_loop {:.3}s", loop_idx, t_loop.elapsed().as_secs_f64());
 
+        // Free artifact polygons before post-loop cleanup.
+        // They'll be re-detected if another loop is needed.
+        current_artifacts = vec![];
+
         // Post-loop cleanup: induce nodes + dedup (matches Python)
+        // Use owned variant to avoid briefly holding two copies of all geometries
         let t_step = Instant::now();
         let (induced_geoms, induced_statuses, induced_parents) =
-            nodes::induce_nodes(&network.geometries, &network.statuses, &network.parent_ids, params.eps);
+            nodes::induce_nodes_owned(
+                std::mem::take(&mut network.geometries),
+                std::mem::take(&mut network.statuses),
+                std::mem::take(&mut network.parent_ids),
+                params.eps,
+            );
         network.geometries = induced_geoms;
         network.statuses = induced_statuses;
         network.parent_ids = induced_parents;
         dedup_network(network);
         log::info!("[neatify] loop {}: post-cleanup {:.3}s ({} edges)", loop_idx, t_step.elapsed().as_secs_f64(), network.geometries.len());
 
-        // Re-detect artifacts for subsequent loops
+        // Re-detect artifacts for subsequent loops (or create empty placeholder for last loop)
         if loop_idx < params.n_loops - 1 {
             let t_step = Instant::now();
             let re_artifacts = artifacts::get_artifacts(
@@ -305,10 +315,8 @@ fn neatify_singletons(
         let artifact = &artifact_geoms[art_idx];
         let ces = &ces_info[local_idx];
 
-        // Compute buffer lazily per artifact to avoid keeping all buffers alive at once
-        let artifact_buf = artifact.buffer(params.eps);
-        let covered_edges = find_covered_edges_buffered(
-            &network.geometries, &tree, artifact, &artifact_buf,
+        let covered_edges = find_covered_edges_with_tree(
+            &network.geometries, &tree, artifact, params.eps,
         );
         if covered_edges.is_empty() {
             continue;
@@ -441,10 +449,8 @@ fn neatify_pairs(
     // Build R-tree once for all pair lookups
     let tree = crate::spatial::build_rtree(&network.geometries);
 
-    // Pre-buffer all referenced artifacts
     // Non-planar detection: stroke_count > node_count
     // (mirrors Python _identify_non_planar)
-    // Compute buffers lazily per artifact to avoid all buffers alive at once.
     let singleton_geoms: Vec<Polygon<f64>> = artifact_indices
         .iter()
         .map(|&i| artifact_geoms[i].clone())
@@ -454,9 +460,8 @@ fn neatify_pairs(
     let mut non_planar: HashSet<usize> = HashSet::new();
     for (local_idx, &art_idx) in artifact_indices.iter().enumerate() {
         let artifact = &artifact_geoms[art_idx];
-        let buf = artifact.buffer(params.eps);
-        let covered = find_covered_edges_buffered(
-            &network.geometries, &tree, artifact, &buf,
+        let covered = find_covered_edges_with_tree(
+            &network.geometries, &tree, artifact, params.eps,
         );
         let covered_geoms: Vec<LineString<f64>> = covered.iter().map(|&i| network.geometries[i].clone()).collect();
         let (node_coords, _) = nodes::nodes_from_edges(&covered_geoms);
@@ -493,14 +498,12 @@ fn neatify_pairs(
             continue;
         }
 
-        // Find edges covered by each artifact (compute buffers per-pair)
-        let buf_a = artifact_geoms[pair[0]].buffer(params.eps);
-        let buf_b = artifact_geoms[pair[1]].buffer(params.eps);
-        let covered_a = find_covered_edges_buffered(
-            &network.geometries, &tree, &artifact_geoms[pair[0]], &buf_a,
+        // Find edges covered by each artifact (distance-based, no buffer needed)
+        let covered_a = find_covered_edges_with_tree(
+            &network.geometries, &tree, &artifact_geoms[pair[0]], params.eps,
         );
-        let covered_b = find_covered_edges_buffered(
-            &network.geometries, &tree, &artifact_geoms[pair[1]], &buf_b,
+        let covered_b = find_covered_edges_with_tree(
+            &network.geometries, &tree, &artifact_geoms[pair[1]], params.eps,
         );
         let set_a: HashSet<usize> = covered_a.iter().copied().collect();
         let set_b: HashSet<usize> = covered_b.iter().copied().collect();
@@ -622,6 +625,35 @@ fn neatify_pairs(
     Ok(())
 }
 
+/// Union a slice of polygons using a cascaded tree strategy.
+/// Pairwise-unions at each level keep operand complexity balanced: O(n log n)
+/// total vertices instead of O(n^2) for sequential accumulation.
+fn cascaded_union(polygons: &[Polygon<f64>]) -> MultiPolygon<f64> {
+    if polygons.is_empty() {
+        return MultiPolygon(vec![]);
+    }
+    if polygons.len() == 1 {
+        return MultiPolygon(vec![polygons[0].clone()]);
+    }
+    let mut level: Vec<MultiPolygon<f64>> = polygons
+        .iter()
+        .map(|p| MultiPolygon(vec![p.clone()]))
+        .collect();
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity((level.len() + 1) / 2);
+        let mut i = 0;
+        while i + 1 < level.len() {
+            next.push(level[i].union(&level[i + 1]));
+            i += 2;
+        }
+        if i < level.len() {
+            next.push(std::mem::replace(&mut level[i], MultiPolygon(vec![])));
+        }
+        level = next;
+    }
+    level.into_iter().next().unwrap_or(MultiPolygon(vec![]))
+}
+
 /// Simplify clusters of face artifacts.
 fn neatify_clusters(
     network: &mut StreetNetwork,
@@ -645,10 +677,9 @@ fn neatify_clusters(
     // Build R-tree once for all cluster lookups
     let tree = crate::spatial::build_rtree(&network.geometries);
 
-    // Process clusters sequentially to limit peak memory — each cluster's
-    // buffer()/relate() allocations are freed before the next starts.
-    // Inner parallelism in find_covered/find_boundary (par_iter on candidates)
-    // still uses all cores within each cluster.
+    // Process clusters sequentially. Inner parallelism in find_covered/
+    // find_boundary (par_iter on candidates) still uses all cores within
+    // each cluster.
     let eligible_clusters: Vec<&Vec<usize>> = sorted_cluster_labels
         .iter()
         .filter_map(|label| {
@@ -658,16 +689,24 @@ fn neatify_clusters(
         .collect();
 
     let t_clusters = Instant::now();
-    for cluster in &eligible_clusters {
-        // Merge all artifact polygons in the cluster
-        let mut merged: MultiPolygon<f64> = MultiPolygon(vec![artifact_geoms[cluster[0]].clone()]);
-        for &i in &cluster[1..] {
-            merged = merged.union(&MultiPolygon(vec![artifact_geoms[i].clone()]));
-        }
+    log::info!("    [clusters] starting {} clusters", eligible_clusters.len());
+    for (ci, cluster) in eligible_clusters.iter().enumerate() {
+        // Merge all artifact polygons in the cluster using cascaded tree union
+        let cluster_polys: Vec<Polygon<f64>> = cluster.iter().map(|&i| artifact_geoms[i].clone()).collect();
+        let merged = cascaded_union(&cluster_polys);
 
         if merged.0.is_empty() {
             continue;
         }
+
+        // Pre-simplify merged polygons to reduce vertex count for distance checks.
+        // Tolerance of eps/10 preserves shape at the eps scale while removing
+        // redundant vertices from union operations.
+        let merged: MultiPolygon<f64> = MultiPolygon::new(
+            merged.0.into_iter()
+                .map(|p| p.simplify(params.eps / 10.0))
+                .collect()
+        );
 
         for merged_poly in &merged.0 {
             let covered = find_covered_edges_with_tree(&network.geometries, &tree, merged_poly, params.eps);
@@ -698,6 +737,9 @@ fn neatify_clusters(
             );
             to_drop.extend(&covered);
             to_add.extend(skel);
+        }
+        if (ci + 1) % 100 == 0 || ci + 1 == eligible_clusters.len() {
+            log::info!("    [clusters] {}/{} done", ci + 1, eligible_clusters.len());
         }
     }
     log::info!("    [clusters] {} clusters processed in {:.3}s", eligible_clusters.len(), t_clusters.elapsed().as_secs_f64());
@@ -1388,24 +1430,14 @@ fn reconnect_c_groups(
 
     let mut additions = Vec::new();
     for c_group in conts_groups {
-        let c_buf: MultiPolygon<f64> = c_group.buffer(eps);
-
         let all_intersect = conn_dissolved.iter().all(|comp| {
-            if !c_buf.0.is_empty() {
-                c_buf.0.iter().any(|p| comp.intersects(p))
-            } else {
-                comp.intersects(c_group)
-            }
+            Euclidean.distance(comp, c_group) <= eps
         });
 
         if !all_intersect {
             // Some components don't reach this C — add shortest connections
             for comp in &conn_dissolved {
-                let intersects = if !c_buf.0.is_empty() {
-                    c_buf.0.iter().any(|p| comp.intersects(p))
-                } else {
-                    comp.intersects(c_group)
-                };
+                let intersects = Euclidean.distance(comp, c_group) <= eps;
 
                 if !intersects {
                     if let Some(sl) = make_shortest_line_between(comp, c_group) {
@@ -1472,8 +1504,8 @@ fn apply_changes(
     if !to_add.is_empty() {
         let merged_adds = merge_and_explode(to_add);
         let deduped = dedup_geometries(&merged_adds);
+        drop(merged_adds);
         let simp_eps = params.max_segment_length * params.simplification_factor;
-        // Collect valid edges first, then share parent_ids (move last, clone rest)
         let valid_edges: Vec<LineString<f64>> = deduped
             .into_iter()
             .filter_map(|geom| {
@@ -1489,12 +1521,14 @@ fn apply_changes(
         for (j, simplified) in valid_edges.into_iter().enumerate() {
             network.geometries.push(simplified);
             network.statuses.push(EdgeStatus::New);
-            // Move the last one, clone the rest
+            // Move dropped_parents into the last edge; others get empty.
+            // Avoids cloning a potentially huge vector (e.g. 72K entries)
+            // for every new edge, which can use multiple GB.
             if j + 1 == n_valid {
                 network.parent_ids.push(dropped_parents);
                 break;
             } else {
-                network.parent_ids.push(dropped_parents.clone());
+                network.parent_ids.push(vec![]);
             }
         }
     }
@@ -1558,11 +1592,15 @@ fn dedup_geometries(geoms: &[LineString<f64>]) -> Vec<LineString<f64>> {
 /// Duplicate edges union their parent_ids into the survivor.
 fn dedup_network(network: &mut StreetNetwork) {
     use std::hash::{Hash, Hasher};
-    let mut seen: HashMap<u64, usize> = HashMap::new();
-    let mut new_geoms = Vec::new();
-    let mut new_statuses = Vec::new();
-    let mut new_parents = Vec::new();
-    for i in 0..network.geometries.len() {
+    let n = network.geometries.len();
+
+    // Phase 1: Hash all geometries and identify duplicates in-place.
+    // Maps hash → first occurrence index. Duplicates get their parent_ids
+    // merged into the survivor and are marked for removal.
+    let mut seen: HashMap<u64, usize> = HashMap::with_capacity(n);
+    let mut to_remove = Vec::new();
+
+    for i in 0..n {
         let normalized = ops::normalize_linestring(&network.geometries[i]);
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         normalized.0.len().hash(&mut hasher);
@@ -1572,25 +1610,34 @@ fn dedup_network(network: &mut StreetNetwork) {
         }
         let hash = hasher.finish();
         if let Some(&survivor_idx) = seen.get(&hash) {
-            // Union parent_ids into the survivor
-            let survivor_parents: &mut Vec<usize> = &mut new_parents[survivor_idx];
-            for &p in &network.parent_ids[i] {
+            // Merge parent_ids into the survivor. Use a temporary to avoid
+            // double-borrowing network.parent_ids.
+            let dup_parents = std::mem::take(&mut network.parent_ids[i]);
+            let survivor_parents = &mut network.parent_ids[survivor_idx];
+            for p in dup_parents {
                 if !survivor_parents.contains(&p) {
                     survivor_parents.push(p);
                 }
             }
             survivor_parents.sort_unstable();
+            to_remove.push(i);
         } else {
-            seen.insert(hash, new_geoms.len());
-            // Move instead of clone — zero allocation
-            new_geoms.push(std::mem::replace(&mut network.geometries[i], LineString::new(vec![])));
-            new_statuses.push(network.statuses[i]);
-            new_parents.push(std::mem::take(&mut network.parent_ids[i]));
+            seen.insert(hash, i);
         }
     }
-    network.geometries = new_geoms;
-    network.statuses = new_statuses;
-    network.parent_ids = new_parents;
+
+    if to_remove.is_empty() {
+        return;
+    }
+
+    // Phase 2: Remove duplicates by compacting in-place (reverse order
+    // swap_remove to avoid index invalidation).
+    to_remove.sort_unstable();
+    for &i in to_remove.iter().rev() {
+        network.geometries.swap_remove(i);
+        network.statuses.swap_remove(i);
+        network.parent_ids.swap_remove(i);
+    }
 }
 
 /// Find edge indices whose geometry is covered by the artifact polygon.
@@ -1605,61 +1652,25 @@ fn find_covered_edges(
 }
 
 /// find_covered_edges using a pre-built R-tree.
+///
+/// Uses distance-based coverage checks instead of buffer+containment to avoid
+/// expensive polygon construction from buffer(). Semantically equivalent to
+/// `artifact.buffer(eps).covers(line)`.
 fn find_covered_edges_with_tree(
     geometries: &[LineString<f64>],
     tree: &rstar::RTree<crate::spatial::IndexedEnvelope>,
     artifact: &Polygon<f64>,
     eps: f64,
 ) -> Vec<usize> {
-    let artifact_buf: MultiPolygon<f64> = artifact.buffer(eps);
-    find_covered_edges_buffered(geometries, tree, artifact, &artifact_buf)
-}
+    // Expand the R-tree query envelope by eps to catch edges within distance
+    let candidates = nodes::envelope_query_indices_expanded(tree, artifact, eps);
 
-/// find_covered_edges using a pre-built R-tree and pre-computed buffer.
-/// Avoids recomputing the buffer when the same artifact is queried multiple times.
-fn find_covered_edges_buffered(
-    geometries: &[LineString<f64>],
-    tree: &rstar::RTree<crate::spatial::IndexedEnvelope>,
-    artifact: &Polygon<f64>,
-    artifact_buf: &MultiPolygon<f64>,
-) -> Vec<usize> {
-    let candidates = nodes::envelope_query_indices_pub(tree, artifact);
-
-    // Pre-compute union bbox of all polygons in artifact_buf for fast rejection
-    let buf_bbox = {
-        use geo::BoundingRect;
-        let mut min_x = f64::INFINITY;
-        let mut min_y = f64::INFINITY;
-        let mut max_x = f64::NEG_INFINITY;
-        let mut max_y = f64::NEG_INFINITY;
-        for p in &artifact_buf.0 {
-            if let Some(r) = p.bounding_rect() {
-                min_x = min_x.min(r.min().x);
-                min_y = min_y.min(r.min().y);
-                max_x = max_x.max(r.max().x);
-                max_y = max_y.max(r.max().y);
-            }
-        }
-        (min_x, min_y, max_x, max_y)
-    };
-
-    // Use rayon for parallel relate checks (these are the expensive part).
-    // Use .map() to preserve IndexedParallelIterator ordering, then filter.
+    // Use rayon for parallel distance checks.
     use rayon::prelude::*;
     let covered: Vec<bool> = candidates
         .par_iter()
         .map(|&i| {
-            // Fast bbox disjoint check before expensive relate
-            if let Some(lr) = geometries[i].bounding_rect() {
-                if lr.min().x > buf_bbox.2
-                    || lr.max().x < buf_bbox.0
-                    || lr.min().y > buf_bbox.3
-                    || lr.max().y < buf_bbox.1
-                {
-                    return false;
-                }
-            }
-            artifact_buf.0.iter().any(|p| line_covered_by_polygon_fast(&geometries[i], p))
+            line_covered_by_distance(&geometries[i], artifact, eps)
         })
         .collect();
     candidates
@@ -1682,54 +1693,34 @@ fn find_boundary_edges(
 }
 
 /// find_boundary_edges using a pre-built R-tree.
+///
+/// Uses distance-based checks instead of buffer+intersects to avoid expensive
+/// polygon construction. An edge is a boundary edge if:
+/// - It is NOT fully covered (distance-based), AND
+/// - It is within eps of the artifact exterior ring
 fn find_boundary_edges_with_tree(
     geometries: &[LineString<f64>],
     tree: &rstar::RTree<crate::spatial::IndexedEnvelope>,
     artifact: &Polygon<f64>,
     eps: f64,
 ) -> Vec<usize> {
-    let candidates = nodes::envelope_query_indices_pub(tree, artifact);
+    // Expand the R-tree query envelope by eps to catch nearby edges
+    let candidates = nodes::envelope_query_indices_expanded(tree, artifact, eps);
 
-    let artifact_buf: MultiPolygon<f64> = artifact.buffer(eps);
-    let boundary_buf: MultiPolygon<f64> = artifact.exterior().clone().buffer(eps);
+    let exterior = artifact.exterior();
 
-    // Pre-compute union bbox of artifact_buf for fast rejection
-    let buf_bbox = {
-        use geo::BoundingRect;
-        let mut min_x = f64::INFINITY;
-        let mut min_y = f64::INFINITY;
-        let mut max_x = f64::NEG_INFINITY;
-        let mut max_y = f64::NEG_INFINITY;
-        for p in &artifact_buf.0 {
-            if let Some(r) = p.bounding_rect() {
-                min_x = min_x.min(r.min().x);
-                min_y = min_y.min(r.min().y);
-                max_x = max_x.max(r.max().x);
-                max_y = max_y.max(r.max().y);
-            }
-        }
-        (min_x, min_y, max_x, max_y)
-    };
-
-    // Use rayon for parallel relate checks (these dominate runtime).
+    // Use rayon for parallel distance checks.
     use rayon::prelude::*;
     let results: Vec<bool> = candidates
         .par_iter()
         .map(|&i| {
             let geom = &geometries[i];
-            // Fast bbox disjoint check
-            if let Some(lr) = geom.bounding_rect() {
-                if lr.min().x > buf_bbox.2
-                    || lr.max().x < buf_bbox.0
-                    || lr.min().y > buf_bbox.3
-                    || lr.max().y < buf_bbox.1
-                {
-                    return false;
-                }
+            let is_covered = line_covered_by_distance(geom, artifact, eps);
+            if is_covered {
+                return false;
             }
-            let is_covered = artifact_buf.0.iter().any(|p| line_covered_by_polygon_fast(geom, p));
-            let touches_boundary = boundary_buf.0.iter().any(|p| geom.intersects(p));
-            !is_covered && touches_boundary
+            // Check if edge is within eps of the artifact exterior boundary
+            Euclidean.distance(geom, exterior) <= eps
         })
         .collect();
     candidates
@@ -1849,6 +1840,28 @@ fn node_coords_to_lines(coords: &[[f64; 2]]) -> Vec<LineString<f64>> {
 ///
 /// If every vertex and segment midpoint of `line` is inside `poly`, the line is covered.
 /// Falls back to full `poly.relate(line).is_covers()` when any test point is outside.
+/// Check if a line is "covered" by an artifact polygon within eps distance.
+///
+/// Semantically equivalent to `buffer(eps).covers(line)` but uses distance
+/// checks instead, avoiding the expensive polygon construction from buffer().
+/// For each vertex and each segment midpoint of the line, checks that the
+/// distance to the artifact is <= eps.
+fn line_covered_by_distance(line: &LineString<f64>, artifact: &Polygon<f64>, eps: f64) -> bool {
+    for coord in &line.0 {
+        let pt = Point::new(coord.x, coord.y);
+        if Euclidean.distance(&pt, artifact) > eps {
+            return false;
+        }
+    }
+    for w in line.0.windows(2) {
+        let mid = Point::new((w[0].x + w[1].x) / 2.0, (w[0].y + w[1].y) / 2.0);
+        if Euclidean.distance(&mid, artifact) > eps {
+            return false;
+        }
+    }
+    true
+}
+
 fn line_covered_by_polygon_fast(line: &LineString<f64>, poly: &Polygon<f64>) -> bool {
     for coord in &line.0 {
         let pt = Point::new(coord.x, coord.y);
