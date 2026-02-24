@@ -1198,7 +1198,7 @@ dependencies = [
 
 [[package]]
 name = "neatnet-core"
-version = "0.1.4"
+version = "0.1.6"
 dependencies = [
  "approx 0.5.1",
  "arrow",
@@ -1223,7 +1223,7 @@ dependencies = [
 
 [[package]]
 name = "neatnet-py"
-version = "0.1.4"
+version = "0.1.6"
 dependencies = [
  "arrow",
  "geo-traits",

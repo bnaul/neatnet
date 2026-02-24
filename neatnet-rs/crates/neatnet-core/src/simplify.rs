@@ -1521,14 +1521,13 @@ fn apply_changes(
         for (j, simplified) in valid_edges.into_iter().enumerate() {
             network.geometries.push(simplified);
             network.statuses.push(EdgeStatus::New);
-            // Move dropped_parents into the last edge; others get empty.
-            // Avoids cloning a potentially huge vector (e.g. 72K entries)
-            // for every new edge, which can use multiple GB.
+            // Every new edge inherits lineage from all dropped edges.
+            // Clone for all but the last; move for the last to save one alloc.
             if j + 1 == n_valid {
                 network.parent_ids.push(dropped_parents);
                 break;
             } else {
-                network.parent_ids.push(vec![]);
+                network.parent_ids.push(dropped_parents.clone());
             }
         }
     }
