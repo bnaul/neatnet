@@ -308,71 +308,79 @@ fn neatify_singletons(
     // Build R-tree once for all singleton lookups
     let tree = crate::spatial::build_rtree(&network.geometries);
 
+    use rayon::prelude::*;
+    let results: Vec<(Vec<usize>, Vec<LineString<f64>>)> = artifact_indices
+        .par_iter()
+        .enumerate()
+        .map(|(local_idx, &art_idx)| {
+            let mut local_drop: Vec<usize> = Vec::new();
+            let mut local_add: Vec<LineString<f64>> = Vec::new();
+
+            let artifact = &artifact_geoms[art_idx];
+            let ces = &ces_info[local_idx];
+
+            let covered_edges = find_covered_edges_with_tree(
+                &network.geometries, &tree, artifact, params.eps,
+            );
+            if covered_edges.is_empty() {
+                return (local_drop, local_add);
+            }
+
+            let covered_geoms: Vec<LineString<f64>> = covered_edges
+                .iter()
+                .map(|&i| network.geometries[i].clone())
+                .collect();
+            let (node_coords, _) = nodes::nodes_from_edges(&covered_geoms);
+            let n_nodes = node_coords.len();
+
+            let n_strokes = ces.stroke_count;
+
+            if n_strokes > n_nodes {
+                return (local_drop, local_add);
+            }
+
+            if n_nodes == 1 && n_strokes == 1 {
+                process_n1_g1_identical(
+                    &covered_edges,
+                    artifact,
+                    &node_coords,
+                    &network.geometries,
+                    params,
+                    &mut local_drop,
+                    &mut local_add,
+                );
+            } else if n_nodes > 1 && is_identical_ces(ces) {
+                process_nx_gx_identical(
+                    &covered_edges,
+                    artifact,
+                    &node_coords,
+                    &network.geometries,
+                    params,
+                    &mut local_drop,
+                    &mut local_add,
+                );
+            } else if n_nodes > 1 {
+                process_nx_gx(
+                    &covered_edges,
+                    artifact,
+                    &node_coords,
+                    &network.geometries,
+                    coins_result,
+                    params,
+                    &mut local_drop,
+                    &mut local_add,
+                );
+            }
+
+            (local_drop, local_add)
+        })
+        .collect();
+
     let mut to_drop: Vec<usize> = Vec::new();
     let mut to_add: Vec<LineString<f64>> = Vec::new();
-
-    for (local_idx, &art_idx) in artifact_indices.iter().enumerate() {
-        let artifact = &artifact_geoms[art_idx];
-        let ces = &ces_info[local_idx];
-
-        let covered_edges = find_covered_edges_with_tree(
-            &network.geometries, &tree, artifact, params.eps,
-        );
-        if covered_edges.is_empty() {
-            continue;
-        }
-
-        // Get network nodes touching this artifact
-        let covered_geoms: Vec<LineString<f64>> = covered_edges
-            .iter()
-            .map(|&i| network.geometries[i].clone())
-            .collect();
-        let (node_coords, _) = nodes::nodes_from_edges(&covered_geoms);
-        let n_nodes = node_coords.len();
-
-        let n_strokes = ces.stroke_count;
-
-        // Non-planar check: skip if stroke count > node count
-        if n_strokes > n_nodes {
-            continue;
-        }
-
-        // Dispatch based on node count and CES composition
-        if n_nodes == 1 && n_strokes == 1 {
-            // n1_g1_identical: single dead-end loop
-            process_n1_g1_identical(
-                &covered_edges,
-                artifact,
-                &node_coords,
-                &network.geometries,
-                params,
-                &mut to_drop,
-                &mut to_add,
-            );
-        } else if n_nodes > 1 && is_identical_ces(ces) {
-            // nx_gx_identical: all strokes have the same CES type
-            process_nx_gx_identical(
-                &covered_edges,
-                artifact,
-                &node_coords,
-                &network.geometries,
-                params,
-                &mut to_drop,
-                &mut to_add,
-            );
-        } else if n_nodes > 1 {
-            // nx_gx: mixed CES types (most complex case)
-            process_nx_gx(
-                &covered_edges,
-                artifact,
-                &node_coords,
-                &network.geometries,
-                coins_result,
-                params,
-                &mut to_drop,
-                &mut to_add,
-            );
-        }
+    for (drops, adds) in results {
+        to_drop.extend(drops);
+        to_add.extend(adds);
     }
 
     apply_changes(network, &to_drop, &to_add, params);
@@ -690,57 +698,65 @@ fn neatify_clusters(
 
     let t_clusters = Instant::now();
     log::info!("    [clusters] starting {} clusters", eligible_clusters.len());
-    for (ci, cluster) in eligible_clusters.iter().enumerate() {
-        // Merge all artifact polygons in the cluster using cascaded tree union
-        let cluster_polys: Vec<Polygon<f64>> = cluster.iter().map(|&i| artifact_geoms[i].clone()).collect();
-        let merged = cascaded_union(&cluster_polys);
 
-        if merged.0.is_empty() {
-            continue;
-        }
+    use rayon::prelude::*;
+    let results: Vec<(Vec<usize>, Vec<LineString<f64>>)> = eligible_clusters
+        .par_iter()
+        .map(|cluster| {
+            let mut local_drop: Vec<usize> = Vec::new();
+            let mut local_add: Vec<LineString<f64>> = Vec::new();
 
-        // Pre-simplify merged polygons to reduce vertex count for distance checks.
-        // Tolerance of eps/10 preserves shape at the eps scale while removing
-        // redundant vertices from union operations.
-        let merged: MultiPolygon<f64> = MultiPolygon::new(
-            merged.0.into_iter()
-                .map(|p| p.simplify(params.eps / 10.0))
-                .collect()
-        );
+            let cluster_polys: Vec<Polygon<f64>> = cluster.iter().map(|&i| artifact_geoms[i].clone()).collect();
+            let merged = cascaded_union(&cluster_polys);
 
-        for merged_poly in &merged.0 {
-            let covered = find_covered_edges_with_tree(&network.geometries, &tree, merged_poly, params.eps);
-            if covered.is_empty() {
-                continue;
+            if merged.0.is_empty() {
+                return (local_drop, local_add);
             }
 
-            let boundary_edges =
-                find_boundary_edges_with_tree(&network.geometries, &tree, merged_poly, params.eps);
-            if boundary_edges.is_empty() {
-                to_drop.extend(&covered);
-                continue;
-            }
-
-            let boundary_geoms: Vec<LineString<f64>> = boundary_edges
-                .iter()
-                .map(|&i| network.geometries[i].clone())
-                .collect();
-            let (skel, _) = geometry::voronoi_skeleton(
-                &boundary_geoms,
-                Some(merged_poly),
-                None,
-                params.max_segment_length,
-                None,
-                None,
-                params.clip_limit,
-                Some(params.consolidation_tolerance),
+            let merged: MultiPolygon<f64> = MultiPolygon::new(
+                merged.0.into_iter()
+                    .map(|p| p.simplify(params.eps / 10.0))
+                    .collect()
             );
-            to_drop.extend(&covered);
-            to_add.extend(skel);
-        }
-        if (ci + 1) % 100 == 0 || ci + 1 == eligible_clusters.len() {
-            log::info!("    [clusters] {}/{} done", ci + 1, eligible_clusters.len());
-        }
+
+            for merged_poly in &merged.0 {
+                let covered = find_covered_edges_with_tree(&network.geometries, &tree, merged_poly, params.eps);
+                if covered.is_empty() {
+                    continue;
+                }
+
+                let boundary_edges =
+                    find_boundary_edges_with_tree(&network.geometries, &tree, merged_poly, params.eps);
+                if boundary_edges.is_empty() {
+                    local_drop.extend(&covered);
+                    continue;
+                }
+
+                let boundary_geoms: Vec<LineString<f64>> = boundary_edges
+                    .iter()
+                    .map(|&i| network.geometries[i].clone())
+                    .collect();
+                let (skel, _) = geometry::voronoi_skeleton(
+                    &boundary_geoms,
+                    Some(merged_poly),
+                    None,
+                    params.max_segment_length,
+                    None,
+                    None,
+                    params.clip_limit,
+                    Some(params.consolidation_tolerance),
+                );
+                local_drop.extend(&covered);
+                local_add.extend(skel);
+            }
+
+            (local_drop, local_add)
+        })
+        .collect();
+
+    for (drops, adds) in results {
+        to_drop.extend(drops);
+        to_add.extend(adds);
     }
     log::info!("    [clusters] {} clusters processed in {:.3}s", eligible_clusters.len(), t_clusters.elapsed().as_secs_f64());
 
@@ -1521,13 +1537,14 @@ fn apply_changes(
         for (j, simplified) in valid_edges.into_iter().enumerate() {
             network.geometries.push(simplified);
             network.statuses.push(EdgeStatus::New);
-            // Every new edge inherits lineage from all dropped edges.
-            // Clone for all but the last; move for the last to save one alloc.
+            // Move dropped_parents into the last edge; others get empty.
+            // Avoids cloning a potentially huge vector (e.g. 72K entries)
+            // for every new edge, which can use multiple GB.
             if j + 1 == n_valid {
                 network.parent_ids.push(dropped_parents);
                 break;
             } else {
-                network.parent_ids.push(dropped_parents.clone());
+                network.parent_ids.push(vec![]);
             }
         }
     }
