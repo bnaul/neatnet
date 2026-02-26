@@ -9,12 +9,71 @@ use std::time::Instant;
 use geo::{Area, BooleanOps, BoundingRect, Centroid, Contains, Distance, Euclidean, Intersects, Length, Relate, Simplify};
 use geo_types::{Coord, LineString, MultiPolygon, Point, Polygon};
 
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressFinish, ProgressStyle};
+
 use crate::artifacts;
 use crate::continuity;
 use crate::geometry;
 use crate::nodes;
 use crate::ops;
 use crate::types::{EdgeStatus, NeatifyParams, StreetNetwork};
+
+/// Minimal stderr wrapper that implements [`indicatif::TermLike`].
+///
+/// Renders progress bars to stderr even without a TTY. Overwrites
+/// the current line with `\r` on each update.
+#[derive(Debug)]
+struct StderrTarget;
+
+impl indicatif::TermLike for StderrTarget {
+    fn width(&self) -> u16 { 80 }
+    fn move_cursor_up(&self, _n: usize) -> std::io::Result<()> { Ok(()) }
+    fn move_cursor_down(&self, _n: usize) -> std::io::Result<()> { Ok(()) }
+    fn move_cursor_right(&self, _n: usize) -> std::io::Result<()> { Ok(()) }
+    fn move_cursor_left(&self, _n: usize) -> std::io::Result<()> { Ok(()) }
+    fn write_line(&self, s: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut err = std::io::stderr().lock();
+        err.write_all(s.as_bytes())?;
+        err.write_all(b"\n")?;
+        err.flush()
+    }
+    fn write_str(&self, s: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut err = std::io::stderr().lock();
+        err.write_all(b"\r")?;
+        err.write_all(s.as_bytes())?;
+        err.flush()
+    }
+    fn clear_line(&self) -> std::io::Result<()> { Ok(()) }
+    fn flush(&self) -> std::io::Result<()> {
+        use std::io::Write;
+        std::io::stderr().flush()
+    }
+}
+
+/// Create a styled progress bar that redraws at most 4 times/sec.
+fn make_progress_bar(len: u64, label: &str) -> ProgressBar {
+    let target = ProgressDrawTarget::term_like_with_hz(Box::new(StderrTarget), 4);
+    let pb = ProgressBar::with_draw_target(Some(len), target)
+        .with_finish(ProgressFinish::Abandon);
+    pb.set_style(
+        ProgressStyle::with_template(&format!(
+            "  {label} [{{bar:30}}] {{pos}}/{{len}} ({{elapsed}})"
+        ))
+            .unwrap()
+            .progress_chars("##-"),
+    );
+    pb
+}
+
+/// Finish a progress bar and emit a newline so it persists on screen.
+fn finish_progress_bar(pb: &ProgressBar, label: &str) {
+    let len = pb.length().unwrap_or(0);
+    let elapsed = pb.elapsed();
+    pb.finish_and_clear();
+    eprintln!("  {label} {len}/{len} ({elapsed:.1?})");
+}
 
 /// Top-level simplification entry point.
 ///
@@ -246,27 +305,33 @@ fn neatify_loop(
     }
     log::info!("  [loop] classify: {:.3}s ({} singles, {} pairs, {} clusters)", t_step.elapsed().as_secs_f64(), singles.len(), pairs.len(), clusters.len());
 
+    // Single progress bar for the entire loop — counts every artifact
+    // processed across singletons, pairs, and clusters.
+    let total = artifact_geoms.len() as u64;
+    let pb = make_progress_bar(total, "simplify");
+
     // 3. Simplify singletons
     if !singles.is_empty() {
         let t_step = Instant::now();
-        neatify_singletons(network, artifact_geoms, &singles, params, None)?;
+        neatify_singletons(network, artifact_geoms, &singles, params, None, Some(&pb))?;
         log::info!("  [loop] neatify_singletons: {:.3}s", t_step.elapsed().as_secs_f64());
     }
 
     // 4. Simplify pairs
     if !pairs.is_empty() {
         let t_step = Instant::now();
-        neatify_pairs(network, artifact_geoms, &pairs, &comp_labels, params)?;
+        neatify_pairs(network, artifact_geoms, &pairs, &comp_labels, params, Some(&pb))?;
         log::info!("  [loop] neatify_pairs: {:.3}s", t_step.elapsed().as_secs_f64());
     }
 
     // 5. Simplify clusters
     if !clusters.is_empty() {
         let t_step = Instant::now();
-        neatify_clusters(network, artifact_geoms, &clusters, &comp_labels, params)?;
+        neatify_clusters(network, artifact_geoms, &clusters, &comp_labels, params, Some(&pb))?;
         log::info!("  [loop] neatify_clusters: {:.3}s", t_step.elapsed().as_secs_f64());
     }
 
+    finish_progress_bar(&pb, "simplify");
     Ok(())
 }
 
@@ -286,6 +351,7 @@ fn neatify_singletons(
     artifact_indices: &[usize],
     params: &NeatifyParams,
     precomputed_coins: Option<&continuity::CoinsResult>,
+    progress: Option<&ProgressBar>,
 ) -> Result<(), NeatifyError> {
     // Reuse caller-provided COINS result, or compute fresh
     let owned_coins;
@@ -323,6 +389,7 @@ fn neatify_singletons(
                 &network.geometries, &tree, artifact, params.eps,
             );
             if covered_edges.is_empty() {
+                if let Some(pb) = progress { pb.inc(1); }
                 return (local_drop, local_add);
             }
 
@@ -336,6 +403,7 @@ fn neatify_singletons(
             let n_strokes = ces.stroke_count;
 
             if n_strokes > n_nodes {
+                if let Some(pb) = progress { pb.inc(1); }
                 return (local_drop, local_add);
             }
 
@@ -372,6 +440,7 @@ fn neatify_singletons(
                 );
             }
 
+            if let Some(pb) = progress { pb.inc(1); }
             (local_drop, local_add)
         })
         .collect();
@@ -445,6 +514,7 @@ fn neatify_pairs(
     artifact_indices: &[usize],
     comp_labels: &[usize],
     params: &NeatifyParams,
+    progress: Option<&ProgressBar>,
 ) -> Result<(), NeatifyError> {
     // Group artifacts by component label into pairs
     let mut pair_groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
@@ -486,6 +556,7 @@ fn neatify_pairs(
 
     for (_label, pair) in &pair_groups {
         if pair.len() != 2 {
+            if let Some(pb) = progress { pb.inc(pair.len() as u64); }
             continue;
         }
 
@@ -519,6 +590,7 @@ fn neatify_pairs(
 
         // Non-planar: empty shared or empty covers
         if shared.is_empty() || covered_a.is_empty() || covered_b.is_empty() {
+            if let Some(pb) = progress { pb.inc(2); }
             continue;
         }
 
@@ -614,20 +686,20 @@ fn neatify_pairs(
         first_indices.extend(&planar_from_np_clusters);
         if !first_indices.is_empty() {
             // Reuse COINS already computed at pairs level (mirrors Python compute_coins=False)
-            neatify_singletons(network, &extended_geoms, &first_indices, params, Some(&coins_result))?;
+            neatify_singletons(network, &extended_geoms, &first_indices, params, Some(&coins_result), progress)?;
         }
 
         // Second pass for iterate pairs – network was modified, recompute COINS
         let second_indices: Vec<usize> = iterate_pairs.iter().map(|p| p[1]).collect();
         if !second_indices.is_empty() {
-            neatify_singletons(network, &extended_geoms, &second_indices, params, None)?;
+            neatify_singletons(network, &extended_geoms, &second_indices, params, None, progress)?;
         }
     }
 
     // Process skeleton pairs via cluster approach
     if !skeleton_pairs.is_empty() {
         let skeleton_indices: Vec<usize> = skeleton_pairs.iter().flatten().copied().collect();
-        neatify_clusters(network, artifact_geoms, &skeleton_indices, comp_labels, params)?;
+        neatify_clusters(network, artifact_geoms, &skeleton_indices, comp_labels, params, progress)?;
     }
 
     Ok(())
@@ -669,6 +741,7 @@ fn neatify_clusters(
     artifact_indices: &[usize],
     comp_labels: &[usize],
     params: &NeatifyParams,
+    progress: Option<&ProgressBar>,
 ) -> Result<(), NeatifyError> {
     // Group artifacts by component label
     let mut cluster_groups: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -685,9 +758,6 @@ fn neatify_clusters(
     // Build R-tree once for all cluster lookups
     let tree = crate::spatial::build_rtree(&network.geometries);
 
-    // Process clusters sequentially. Inner parallelism in find_covered/
-    // find_boundary (par_iter on candidates) still uses all cores within
-    // each cluster.
     let eligible_clusters: Vec<&Vec<usize>> = sorted_cluster_labels
         .iter()
         .filter_map(|label| {
@@ -697,7 +767,6 @@ fn neatify_clusters(
         .collect();
 
     let t_clusters = Instant::now();
-    log::info!("    [clusters] starting {} clusters", eligible_clusters.len());
 
     use rayon::prelude::*;
     let results: Vec<(Vec<usize>, Vec<LineString<f64>>)> = eligible_clusters
@@ -706,10 +775,12 @@ fn neatify_clusters(
             let mut local_drop: Vec<usize> = Vec::new();
             let mut local_add: Vec<LineString<f64>> = Vec::new();
 
+            let n_artifacts = cluster.len() as u64;
             let cluster_polys: Vec<Polygon<f64>> = cluster.iter().map(|&i| artifact_geoms[i].clone()).collect();
             let merged = cascaded_union(&cluster_polys);
 
             if merged.0.is_empty() {
+                if let Some(pb) = progress { pb.inc(n_artifacts); }
                 return (local_drop, local_add);
             }
 
@@ -750,6 +821,7 @@ fn neatify_clusters(
                 local_add.extend(skel);
             }
 
+            if let Some(pb) = progress { pb.inc(n_artifacts); }
             (local_drop, local_add)
         })
         .collect();

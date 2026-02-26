@@ -20,6 +20,7 @@ thiserror = { workspace = true }
 log = { workspace = true }
 ordered-float = { workspace = true }
 rayon = { workspace = true }
+indicatif = { workspace = true }
 hashbrown = { workspace = true }
 
 # Optional deps for CLI binary
