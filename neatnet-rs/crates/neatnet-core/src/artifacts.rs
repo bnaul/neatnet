@@ -5,12 +5,11 @@
 
 use std::f64::consts::PI;
 
-use geo::{Area, BoundingRect, Euclidean, Intersects, Length, Relate};
+use geo::{Area, Euclidean, Intersects, Length};
 use geo_types::{LineString, Polygon};
 use petgraph::graph::UnGraph;
 
 use crate::ops;
-use crate::spatial;
 
 /// Shape metric: isoareal quotient (Altman's PA_3).
 pub fn isoareal_quotient(area: f64, perimeter: f64) -> f64 {
@@ -411,55 +410,111 @@ fn find_fai_threshold(fai_values: &[f64]) -> Option<f64> {
     None
 }
 
-/// Build a rook contiguity graph from polygons.
+/// Coordinate key for exact-float hashing in contiguity detection.
+/// Matches the rounding used by `ops::polygonize`, so polygons that share
+/// a boundary from polygonize will have identical segment keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SegCoordKey {
+    x: i64,
+    y: i64,
+}
+
+fn seg_coord_key(c: geo_types::Coord<f64>) -> SegCoordKey {
+    SegCoordKey {
+        x: (c.x * 1e8).round() as i64,
+        y: (c.y * 1e8).round() as i64,
+    }
+}
+
+/// Build a rook or queen contiguity graph from polygons.
+///
+/// For rook contiguity (shared edge), uses a segment-hash approach that is
+/// O(total_boundary_segments) instead of the previous O(n × candidates × relate_cost).
+/// Since polygons come from `polygonize`, adjacent polygons share exact boundary
+/// coordinates, so we find adjacency by hashing boundary segments and looking
+/// for segments that appear in two different polygons.
 pub fn build_contiguity_graph(polygons: &[Polygon<f64>], rook: bool) -> Vec<Vec<usize>> {
-    use rayon::prelude::*;
-
     let n = polygons.len();
-    let tree = spatial::build_rtree_polys(polygons);
 
-    // Each polygon independently finds its adjacent pairs (j > i only to avoid duplicates).
-    // Collect (i, j) pairs in parallel, then build adjacency list.
-    let pairs: Vec<Vec<(usize, usize)>> = (0..n)
-        .into_par_iter()
-        .map(|i| {
-            let mut local_pairs = Vec::new();
-            let rect = match polygons[i].bounding_rect() {
-                Some(r) => r,
-                None => return local_pairs,
-            };
-            let min = [rect.min().x, rect.min().y];
-            let max = [rect.max().x, rect.max().y];
+    if rook {
+        build_contiguity_graph_rook(polygons, n)
+    } else {
+        build_contiguity_graph_queen(polygons, n)
+    }
+}
 
-            let candidates = spatial::query_envelope(&tree, min, max);
-            for j in candidates {
-                if j <= i { continue; }
-                let touches = if rook {
-                    let de9im = polygons[i].relate(&polygons[j]);
-                    {
-                        use geo::coordinate_position::CoordPos;
-                        de9im.get(CoordPos::OnBoundary, CoordPos::OnBoundary) == geo::dimensions::Dimensions::OneDimensional
-                            || de9im.get(CoordPos::OnBoundary, CoordPos::OnBoundary) == geo::dimensions::Dimensions::TwoDimensional
-                    }
-                } else {
-                    polygons[i].relate(&polygons[j]).is_touches()
-                        || polygons[i].intersects(&polygons[j])
-                };
-                if touches {
-                    local_pairs.push((i, j));
-                }
-            }
-            local_pairs
-        })
-        .collect();
+/// Rook contiguity: two polygons are adjacent if they share a boundary edge
+/// (1-dimensional intersection). Uses segment hashing for O(total_segments) performance.
+fn build_contiguity_graph_rook(polygons: &[Polygon<f64>], n: usize) -> Vec<Vec<usize>> {
+    use std::collections::HashMap;
 
-    // Merge pairs into bidirectional adjacency list
+    // Map from canonical edge segment → list of polygon indices that have it.
+    // A canonical segment uses the smaller coord key first for undirected matching.
+    let mut segment_to_polys: HashMap<(SegCoordKey, SegCoordKey), Vec<usize>> = HashMap::new();
+
+    for (i, poly) in polygons.iter().enumerate() {
+        let ring = poly.exterior();
+        for w in ring.0.windows(2) {
+            let a = seg_coord_key(w[0]);
+            let b = seg_coord_key(w[1]);
+            if a == b { continue; }
+            let key = if (a.x, a.y) <= (b.x, b.y) { (a, b) } else { (b, a) };
+            segment_to_polys.entry(key).or_default().push(i);
+        }
+    }
+
+    // Build adjacency from shared segments
     let mut adjacency: Vec<Vec<usize>> = vec![vec![]; n];
-    for local_pairs in pairs {
-        for (i, j) in local_pairs {
+    for polys in segment_to_polys.values() {
+        if polys.len() == 2 {
+            let (i, j) = (polys[0], polys[1]);
             adjacency[i].push(j);
             adjacency[j].push(i);
         }
+    }
+
+    // Deduplicate (multiple shared segments between same pair → duplicate entries)
+    for adj in &mut adjacency {
+        adj.sort();
+        adj.dedup();
+    }
+
+    adjacency
+}
+
+/// Queen contiguity: two polygons are adjacent if they share any boundary point
+/// (0-dimensional or higher intersection). Uses vertex hashing.
+fn build_contiguity_graph_queen(polygons: &[Polygon<f64>], n: usize) -> Vec<Vec<usize>> {
+    use std::collections::HashMap;
+
+    // Map from vertex → list of polygon indices
+    let mut vertex_to_polys: HashMap<SegCoordKey, Vec<usize>> = HashMap::new();
+
+    for (i, poly) in polygons.iter().enumerate() {
+        let ring = poly.exterior();
+        // Skip last coord (duplicate of first in closed ring)
+        for c in &ring.0[..ring.0.len().saturating_sub(1)] {
+            let key = seg_coord_key(*c);
+            vertex_to_polys.entry(key).or_default().push(i);
+        }
+    }
+
+    // Build adjacency from shared vertices
+    let mut adjacency: Vec<Vec<usize>> = vec![vec![]; n];
+    for polys in vertex_to_polys.values() {
+        // All polygons sharing this vertex are mutually adjacent
+        for a_idx in 0..polys.len() {
+            for b_idx in (a_idx + 1)..polys.len() {
+                let (i, j) = (polys[a_idx], polys[b_idx]);
+                adjacency[i].push(j);
+                adjacency[j].push(i);
+            }
+        }
+    }
+
+    for adj in &mut adjacency {
+        adj.sort();
+        adj.dedup();
     }
 
     adjacency
