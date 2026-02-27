@@ -246,14 +246,19 @@ pub fn get_artifacts(
     isoareal_threshold_circles_enclosed: f64,
     isoperimetric_threshold_circles_touching: f64,
 ) -> Option<(Vec<Polygon<f64>>, Vec<f64>, f64)> {
+    use std::time::Instant;
+
     // 1. Polygonize
+    let t = Instant::now();
     let poly_geoms = ops::polygonize(geometries);
+    log::info!("    [artifacts] polygonize: {:.3}s ({} polygons)", t.elapsed().as_secs_f64(), poly_geoms.len());
 
     if poly_geoms.is_empty() {
         return None;
     }
 
     // 2. Compute FAI values (parallelized — MBC via Welzl is expensive)
+    let t = Instant::now();
     use rayon::prelude::*;
     let fai_values: Vec<f64> = poly_geoms
         .par_iter()
@@ -263,6 +268,7 @@ pub fn get_artifacts(
             (mbc_ratio * area).ln()
         })
         .collect();
+    log::info!("    [artifacts] FAI values: {:.3}s", t.elapsed().as_secs_f64());
 
     // 3. Determine FAI threshold
     let final_threshold = if let Some(t) = threshold {
@@ -286,7 +292,9 @@ pub fn get_artifacts(
         .map(|(&a, &p)| isoperimetric_quotient(a, p)).collect();
 
     // 6. Build rook contiguity graph
+    let t = Instant::now();
     let adjacency = build_contiguity_graph(&poly_geoms, true);
+    log::info!("    [artifacts] contiguity graph: {:.3}s", t.elapsed().as_secs_f64());
     let is_isolate: Vec<bool> = adjacency.iter().map(|adj| adj.is_empty()).collect();
 
     // 7. Iterative expansion
@@ -405,40 +413,52 @@ fn find_fai_threshold(fai_values: &[f64]) -> Option<f64> {
 
 /// Build a rook contiguity graph from polygons.
 pub fn build_contiguity_graph(polygons: &[Polygon<f64>], rook: bool) -> Vec<Vec<usize>> {
+    use rayon::prelude::*;
+
     let n = polygons.len();
     let tree = spatial::build_rtree_polys(polygons);
-    let mut adjacency: Vec<Vec<usize>> = vec![vec![]; n];
 
-    for i in 0..n {
-        let rect = match polygons[i].bounding_rect() {
-            Some(r) => r,
-            None => continue,
-        };
-        let min = [rect.min().x, rect.min().y];
-        let max = [rect.max().x, rect.max().y];
-
-        let candidates = spatial::query_envelope(&tree, min, max);
-        for j in candidates {
-            if j <= i { continue; }
-            let touches = if rook {
-                // Rook: shared edge (intersection has length > 0)
-                // For rook, we need shared edges. Use relate to check.
-                let de9im = polygons[i].relate(&polygons[j]);
-                // Rook adjacency = shared boundary is 1-dimensional (line, not just point)
-                // DE-9IM: check if boundary-boundary intersection is at least 1D
-                {
-                    use geo::coordinate_position::CoordPos;
-                    de9im.get(CoordPos::OnBoundary, CoordPos::OnBoundary) == geo::dimensions::Dimensions::OneDimensional
-                        || de9im.get(CoordPos::OnBoundary, CoordPos::OnBoundary) == geo::dimensions::Dimensions::TwoDimensional
-                }
-            } else {
-                polygons[i].relate(&polygons[j]).is_touches()
-                    || polygons[i].intersects(&polygons[j])
+    // Each polygon independently finds its adjacent pairs (j > i only to avoid duplicates).
+    // Collect (i, j) pairs in parallel, then build adjacency list.
+    let pairs: Vec<Vec<(usize, usize)>> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let mut local_pairs = Vec::new();
+            let rect = match polygons[i].bounding_rect() {
+                Some(r) => r,
+                None => return local_pairs,
             };
-            if touches {
-                adjacency[i].push(j);
-                adjacency[j].push(i);
+            let min = [rect.min().x, rect.min().y];
+            let max = [rect.max().x, rect.max().y];
+
+            let candidates = spatial::query_envelope(&tree, min, max);
+            for j in candidates {
+                if j <= i { continue; }
+                let touches = if rook {
+                    let de9im = polygons[i].relate(&polygons[j]);
+                    {
+                        use geo::coordinate_position::CoordPos;
+                        de9im.get(CoordPos::OnBoundary, CoordPos::OnBoundary) == geo::dimensions::Dimensions::OneDimensional
+                            || de9im.get(CoordPos::OnBoundary, CoordPos::OnBoundary) == geo::dimensions::Dimensions::TwoDimensional
+                    }
+                } else {
+                    polygons[i].relate(&polygons[j]).is_touches()
+                        || polygons[i].intersects(&polygons[j])
+                };
+                if touches {
+                    local_pairs.push((i, j));
+                }
             }
+            local_pairs
+        })
+        .collect();
+
+    // Merge pairs into bidirectional adjacency list
+    let mut adjacency: Vec<Vec<usize>> = vec![vec![]; n];
+    for local_pairs in pairs {
+        for (i, j) in local_pairs {
+            adjacency[i].push(j);
+            adjacency[j].push(i);
         }
     }
 
