@@ -167,9 +167,29 @@ fn main() {
         ..NeatifyParams::default()
     };
 
+    // Check for --output flag
+    let output_path = args.iter().position(|a| a == "--output").and_then(|i| args.get(i + 1));
+
     eprintln!("Running neatify with n_loops={}...", n_loops);
     let t0 = Instant::now();
     neatnet_core::simplify::neatify(&mut network, &params, None).unwrap();
     eprintln!("neatify completed in {:.3}s", t0.elapsed().as_secs_f64());
     eprintln!("Output: {} edges", network.geometries.len());
+
+    if let Some(out_path) = output_path {
+        use std::io::Write;
+        let mut f = std::io::BufWriter::new(fs::File::create(out_path).expect("Failed to create output file"));
+        for geom in &network.geometries {
+            use std::fmt::Write as FmtWrite;
+            let mut wkt = String::new();
+            write!(&mut wkt, "LINESTRING(").unwrap();
+            for (j, coord) in geom.0.iter().enumerate() {
+                if j > 0 { write!(&mut wkt, ",").unwrap(); }
+                write!(&mut wkt, "{} {}", coord.x, coord.y).unwrap();
+            }
+            write!(&mut wkt, ")").unwrap();
+            writeln!(f, "{}", wkt).expect("Failed to write WKT");
+        }
+        eprintln!("Wrote output to {}", out_path);
+    }
 }

@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use geo::{Area, BooleanOps, BoundingRect, Centroid, Contains, Distance, Euclidean, Intersects, Length, Relate, Simplify};
-use geo_types::{Coord, LineString, MultiPolygon, Point, Polygon};
+use geo_types::{Coord, Line, LineString, MultiPolygon, Point, Polygon};
 
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressFinish, ProgressStyle};
 
@@ -938,9 +938,52 @@ fn split_cluster_spatially(
         cells.entry((row, col)).or_default().push(art_idx);
     }
 
-    // Collect non-empty cells as sub-clusters, filtering out tiny ones
-    // (sub-clusters < 3 artifacts can't form valid clusters)
-    cells.into_values().filter(|c| c.len() >= 3).collect()
+    // Separate large (>= 3) and small (< 3) sub-clusters
+    let mut large: Vec<Vec<usize>> = Vec::new();
+    let mut orphans: Vec<usize> = Vec::new();
+    for cell in cells.into_values() {
+        if cell.len() >= 3 {
+            large.push(cell);
+        } else {
+            orphans.extend(cell);
+        }
+    }
+
+    // If no large sub-clusters exist, return the original cluster unsplit
+    if large.is_empty() {
+        return vec![cluster.to_vec()];
+    }
+
+    // Reassign each orphan to the nearest large sub-cluster by centroid distance
+    for orphan_idx in orphans {
+        let orphan_centroid = match artifact_geoms[orphan_idx].centroid() {
+            Some(pt) => pt,
+            None => {
+                // No centroid — just put it in the first large sub-cluster
+                large[0].push(orphan_idx);
+                continue;
+            }
+        };
+
+        let mut best = 0usize;
+        let mut best_dist = f64::INFINITY;
+        for (i, sub) in large.iter().enumerate() {
+            // Use centroid of the first artifact in the sub-cluster as a representative
+            // (computing a full sub-cluster centroid is unnecessary overhead)
+            if let Some(pt) = artifact_geoms[sub[0]].centroid() {
+                let dx = orphan_centroid.x() - pt.x();
+                let dy = orphan_centroid.y() - pt.y();
+                let d = dx * dx + dy * dy;
+                if d < best_dist {
+                    best_dist = d;
+                    best = i;
+                }
+            }
+        }
+        large[best].push(orphan_idx);
+    }
+
+    large
 }
 
 /// Simplify clusters of face artifacts.
@@ -1039,23 +1082,75 @@ fn neatify_clusters(
             let boundary_edges =
                 find_boundary_edges_with_tree(&network.geometries, &tree, merged_poly, params.eps);
             if boundary_edges.is_empty() {
-                return Some((covered, Vec::new()));
+                return None; // No connections — leave edges untouched (matches Python)
             }
 
-            let boundary_geoms: Vec<LineString<f64>> = boundary_edges
-                .iter()
-                .map(|&i| network.geometries[i].clone())
-                .collect();
+            // Use the polygon exterior ring as skeleton input, split at connection points
+            // (where boundary-crossing edges touch the polygon). This produces separate
+            // input lines for each "side" of the polygon, so voronoi_skeleton generates
+            // proper centerline ridges between opposite sides.
+            let tol = params.eps.max(1e-3);
+            let connection_pts = find_connection_points(
+                &network.geometries, &boundary_edges, merged_poly.exterior(), tol,
+            );
+            let ring_sides = split_ring_at_points(merged_poly.exterior(), &connection_pts, tol);
+
+            if ring_sides.len() < 2 {
+                // Need at least 2 sides for skeleton to produce ridges
+                return None;
+            }
+
+            // Use small clip_limit since input lines are ON the boundary
+            // (matches Python's clip_limit=1e-4 for clusters).
             let (skel, _) = geometry::voronoi_skeleton(
-                &boundary_geoms,
+                &ring_sides,
                 Some(merged_poly),
                 None,
                 params.max_segment_length,
                 None,
                 None,
-                params.clip_limit,
+                1e-4,
                 Some(params.consolidation_tolerance),
             );
+
+            // Safeguard 1: if the skeleton is pathologically short, it has collapsed.
+            let covered_len: f64 = covered.iter().map(|&i| Euclidean.length(&network.geometries[i])).sum();
+            let skel_len: f64 = skel.iter().map(|s| Euclidean.length(s)).sum();
+            if covered_len > 0.0 && skel_len < covered_len * 0.1 {
+                log::info!("    [clusters] skeleton collapsed ({:.0}m vs {:.0}m covered) — preserving edges",
+                    skel_len, covered_len);
+                return None;
+            }
+
+            // Safeguard 2: verify every connection point has a nearby skeleton endpoint.
+            // If any connection point is orphaned, the skeleton would create a gap in
+            // the network. Better to not simplify than to disconnect the graph.
+            if !connection_pts.is_empty() {
+                let connect_tol = params.consolidation_tolerance;
+                let skel_endpoints: Vec<Coord<f64>> = skel.iter()
+                    .flat_map(|s| {
+                        let first = *s.0.first().unwrap();
+                        let last = *s.0.last().unwrap();
+                        std::iter::once(first).chain(std::iter::once(last))
+                    })
+                    .collect();
+
+                let orphaned = connection_pts.iter().any(|cp| {
+                    !skel_endpoints.iter().any(|sep| {
+                        let dx = cp.x - sep.x;
+                        let dy = cp.y - sep.y;
+                        dx * dx + dy * dy <= connect_tol * connect_tol
+                    })
+                });
+
+                if orphaned {
+                    log::info!(
+                        "    [clusters] skeleton disconnects a connection point — preserving edges"
+                    );
+                    return None;
+                }
+            }
+
             Some((covered, skel))
         })
         .collect();
@@ -2061,6 +2156,128 @@ fn find_boundary_edges_with_tree(
         .collect()
 }
 
+/// Find where boundary-crossing edges intersect the polygon exterior ring.
+///
+/// Computes actual line-segment intersection points between boundary edge
+/// segments and exterior ring segments. These crossing points are where the
+/// polygon connects to the broader network, used to split the ring into "sides".
+fn find_connection_points(
+    geometries: &[LineString<f64>],
+    boundary_edges: &[usize],
+    exterior: &LineString<f64>,
+    _tol: f64,
+) -> Vec<Coord<f64>> {
+    let mut points = Vec::new();
+    for &i in boundary_edges {
+        let edge = &geometries[i];
+        for edge_seg in edge.lines() {
+            for ring_seg in exterior.lines() {
+                if let Some(pt) = segment_intersection(&edge_seg, &ring_seg) {
+                    points.push(pt);
+                }
+            }
+        }
+    }
+    points
+}
+
+/// Compute the intersection point of two line segments, if any.
+fn segment_intersection(a: &Line<f64>, b: &Line<f64>) -> Option<Coord<f64>> {
+    let x1 = a.start.x; let y1 = a.start.y;
+    let x2 = a.end.x;   let y2 = a.end.y;
+    let x3 = b.start.x; let y3 = b.start.y;
+    let x4 = b.end.x;   let y4 = b.end.y;
+
+    let denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4);
+    if denom.abs() < 1e-12 {
+        return None; // Parallel or coincident
+    }
+
+    let t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom;
+    let u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom;
+
+    if t >= -1e-9 && t <= 1.0 + 1e-9 && u >= -1e-9 && u <= 1.0 + 1e-9 {
+        Some(Coord {
+            x: x1 + t * (x2 - x1),
+            y: y1 + t * (y2 - y1),
+        })
+    } else {
+        None
+    }
+}
+
+/// Split a polygon exterior ring at given points, returning the arcs between split points.
+///
+/// For each split point, finds the nearest ring vertex and splits there. This handles
+/// crossing points that fall between ring vertices (from segment_intersection).
+/// Returns arcs between consecutive split positions. Needs at least 2 distinct split
+/// positions to produce 2+ arcs.
+fn split_ring_at_points(
+    ring: &LineString<f64>,
+    split_points: &[Coord<f64>],
+    _tol: f64,
+) -> Vec<LineString<f64>> {
+    if split_points.is_empty() || ring.0.len() < 4 {
+        return vec![ring.clone()];
+    }
+
+    let n = ring.0.len() - 1; // Exclude closing duplicate vertex
+
+    // For each split point, find the nearest ring vertex index
+    let mut split_indices: Vec<usize> = Vec::new();
+    for sp in split_points {
+        let mut best_idx = 0;
+        let mut best_dist_sq = f64::INFINITY;
+        for (i, coord) in ring.0[..n].iter().enumerate() {
+            let dx = coord.x - sp.x;
+            let dy = coord.y - sp.y;
+            let d_sq = dx * dx + dy * dy;
+            if d_sq < best_dist_sq {
+                best_dist_sq = d_sq;
+                best_idx = i;
+            }
+        }
+        split_indices.push(best_idx);
+    }
+
+    // Deduplicate and sort
+    split_indices.sort_unstable();
+    split_indices.dedup();
+
+    if split_indices.len() < 2 {
+        // Need at least 2 split positions to create 2+ arcs
+        return vec![ring.clone()];
+    }
+
+    // Walk the ring from each split index to the next, collecting arcs
+    let mut arcs: Vec<LineString<f64>> = Vec::new();
+
+    for w in 0..split_indices.len() {
+        let start = split_indices[w];
+        let end = split_indices[(w + 1) % split_indices.len()];
+
+        let mut coords: Vec<Coord<f64>> = Vec::new();
+        let mut i = start;
+        loop {
+            coords.push(ring.0[i]);
+            if i == end && coords.len() > 1 {
+                break;
+            }
+            i = (i + 1) % n;
+            if coords.len() > n + 1 {
+                break; // Safety: prevent infinite loop
+            }
+        }
+
+        if coords.len() >= 2 {
+            arcs.push(LineString::new(coords));
+        }
+    }
+
+    arcs.retain(|ls| ls.0.len() >= 2 && Euclidean.length(ls) > 0.0);
+    arcs
+}
+
 /// Find network nodes near a polygon (within eps).
 fn find_nodes_near_polygon(
     node_coords: &[[f64; 2]],
@@ -2372,5 +2589,53 @@ mod tests {
         let line = make_shortest_to_edges(&point, &[edge]).unwrap();
         let len = Euclidean.length(&line);
         assert!((len - 3.0).abs() < 0.01, "shortest line from (5,3) to x-axis should be ~3");
+    }
+
+    #[test]
+    fn test_split_cluster_spatially_preserves_all_artifacts() {
+        // Create 10 artifact polygons spread across space, including some that
+        // will land alone in a grid cell (orphans with < 3 per cell).
+        let mut geoms = Vec::new();
+        for i in 0..10 {
+            let x = (i as f64) * 100.0;
+            geoms.push(make_poly(&[
+                [x, 0.0], [x + 1.0, 0.0], [x + 1.0, 1.0], [x, 1.0], [x, 0.0],
+            ]));
+        }
+
+        let cluster: Vec<usize> = (0..10).collect();
+        let result = split_cluster_spatially(&cluster, &geoms, 3);
+
+        // Collect all artifact indices from the result
+        let mut all_indices: Vec<usize> = result.into_iter().flatten().collect();
+        all_indices.sort();
+
+        assert_eq!(
+            all_indices,
+            (0..10).collect::<Vec<_>>(),
+            "all artifact indices must be preserved — none should be dropped"
+        );
+    }
+
+    #[test]
+    fn test_split_cluster_spatially_all_tiny_returns_original() {
+        // When all sub-clusters would be < 3, return original cluster unsplit
+        let geoms: Vec<Polygon<f64>> = (0..4)
+            .map(|i| {
+                let x = (i as f64) * 1000.0; // Far apart — each in its own cell
+                make_poly(&[
+                    [x, 0.0], [x + 1.0, 0.0], [x + 1.0, 1.0], [x, 1.0], [x, 0.0],
+                ])
+            })
+            .collect();
+
+        let cluster: Vec<usize> = (0..4).collect();
+        let result = split_cluster_spatially(&cluster, &geoms, 2);
+
+        // Should return a single cluster with all artifacts
+        assert_eq!(result.len(), 1, "should return single unsplit cluster");
+        let mut indices: Vec<usize> = result[0].clone();
+        indices.sort();
+        assert_eq!(indices, vec![0, 1, 2, 3]);
     }
 }
