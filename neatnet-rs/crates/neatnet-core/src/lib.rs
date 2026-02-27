@@ -39,5 +39,5 @@ pub mod spatial;
 pub mod types;
 
 // Re-export key types at crate root for convenience
-pub use simplify::neatify;
+pub use simplify::{diagnostics, neatify, NeatifyDiagnostics};
 pub use types::{EdgeStatus, NeatifyParams, StreetNetwork};

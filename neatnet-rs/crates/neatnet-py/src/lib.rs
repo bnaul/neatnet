@@ -21,8 +21,11 @@ use pyo3_arrow::PyTable;
 /// The neatnet_rs Python module.
 #[pymodule]
 fn _neatnet_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Initialise env_logger once so RUST_LOG=info etc. works from Python.
+    let _ = env_logger::try_init();
     m.add_function(wrap_pyfunction!(neatify, m)?)?;
     m.add_function(wrap_pyfunction!(neatify_wkt, m)?)?;
+    m.add_function(wrap_pyfunction!(diagnostics, m)?)?;
     m.add_function(wrap_pyfunction!(coins, m)?)?;
     m.add_function(wrap_pyfunction!(coins_wkt, m)?)?;
     m.add_function(wrap_pyfunction!(voronoi_skeleton_wkt, m)?)?;
@@ -238,6 +241,71 @@ fn neatify<'py>(
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
     PyTable::try_new(vec![result_batch], result_schema)?.into_pyarrow(py)
+}
+
+/// Run diagnostic / dry-run mode on a street network.
+///
+/// Runs the cheap setup phases (fix_topology, consolidate_nodes, artifact
+/// detection, classification) and returns a dict of complexity metrics
+/// without performing any simplification.
+#[pyfunction]
+#[pyo3(signature = (
+    table,
+    *,
+    max_segment_length=1.0,
+    consolidation_tolerance=10.0,
+    artifact_threshold=None,
+    artifact_threshold_fallback=7.0,
+    eps=1e-4,
+))]
+fn diagnostics<'py>(
+    py: Python<'py>,
+    table: PyTable,
+    max_segment_length: f64,
+    consolidation_tolerance: f64,
+    artifact_threshold: Option<f64>,
+    artifact_threshold_fallback: f64,
+    eps: f64,
+) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+    let (geo_geoms, _batch, _schema, _metadata) = table_to_linestrings(table)?;
+    let n_input = geo_geoms.len();
+    let statuses = vec![neatnet_core::EdgeStatus::Original; n_input];
+    let parent_ids: Vec<Vec<usize>> = (0..n_input).map(|i| vec![i]).collect();
+
+    let mut network = neatnet_core::StreetNetwork {
+        geometries: geo_geoms,
+        statuses,
+        parent_ids,
+        attributes: None,
+        crs: None,
+    };
+
+    let params = neatnet_core::NeatifyParams {
+        max_segment_length,
+        consolidation_tolerance,
+        artifact_threshold,
+        artifact_threshold_fallback,
+        eps,
+        ..Default::default()
+    };
+
+    let diag = neatnet_core::diagnostics(&mut network, &params, None)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+    let dict = pyo3::types::PyDict::new(py);
+    dict.set_item("n_input_edges", diag.n_input_edges)?;
+    dict.set_item("n_edges_after_topology", diag.n_edges_after_topology)?;
+    dict.set_item("n_artifacts", diag.n_artifacts)?;
+    dict.set_item("fai_threshold", diag.fai_threshold)?;
+    dict.set_item("n_singles", diag.n_singles)?;
+    dict.set_item("n_pairs", diag.n_pairs)?;
+    dict.set_item("n_cluster_artifacts", diag.n_cluster_artifacts)?;
+    dict.set_item("n_cluster_groups", diag.n_cluster_groups)?;
+    dict.set_item("max_cluster_size", diag.max_cluster_size)?;
+    dict.set_item("fix_topology_secs", diag.fix_topology_secs)?;
+    dict.set_item("consolidate_secs", diag.consolidate_secs)?;
+    dict.set_item("artifact_detection_secs", diag.artifact_detection_secs)?;
+    Ok(dict)
 }
 
 /// Run COINS continuity analysis on an Arrow table.

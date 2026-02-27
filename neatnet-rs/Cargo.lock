@@ -1231,7 +1231,7 @@ dependencies = [
 
 [[package]]
 name = "neatnet-core"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "approx 0.5.1",
  "arrow",
@@ -1257,12 +1257,14 @@ dependencies = [
 
 [[package]]
 name = "neatnet-py"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "arrow",
+ "env_logger",
  "geo-traits",
  "geo-types",
  "geoarrow",
+ "log",
  "neatnet-core",
  "pyo3",
  "pyo3-arrow",
