@@ -239,6 +239,9 @@ pub fn neatify(
     params: &NeatifyParams,
     exclusion_mask: Option<&[Polygon<f64>]>,
 ) -> Result<(), NeatifyError> {
+    // Save original input for connectivity repair at the end.
+    let original_geometries: Vec<LineString<f64>> = network.geometries.clone();
+
     // Step 1: Fix topology
     let t_step = Instant::now();
     let (fixed_geoms, fixed_statuses, fixed_parents) =
@@ -363,6 +366,26 @@ pub fn neatify(
         } else {
             i += 1;
         }
+    }
+
+    // Connectivity repair: for each pre-loop edge whose endpoints now land in
+    // different output components, add a bridging edge between the nearest
+    // actual output endpoints.
+    let t_step = Instant::now();
+    // Match tolerance: original endpoints may have moved during fix_topology
+    // and consolidate_nodes. Use 5x consolidation_tolerance to account for this.
+    let repair_tol = params.consolidation_tolerance * 5.0;
+    let n_repaired = repair_connectivity_spatial(network, &original_geometries, repair_tol);
+    if n_repaired > 0 {
+        eprintln!("  connectivity_repair: {:.1}s ({} edges restored)", t_step.elapsed().as_secs_f64(), n_repaired);
+    }
+
+    // Snap endpoints: merge endpoints within a small tolerance to eliminate
+    // micro-gaps (e.g. 10mm mismatches from skeleton generation).
+    let t_step = Instant::now();
+    let n_snapped = snap_endpoints(network, 1.0);
+    if n_snapped > 0 {
+        eprintln!("  snap_endpoints: {:.1}s ({} endpoints snapped)", t_step.elapsed().as_secs_f64(), n_snapped);
     }
 
     Ok(())
@@ -584,6 +607,16 @@ fn neatify_singletons(
                     &mut local_drop,
                     &mut local_add,
                 );
+            }
+
+            // Connectivity safeguard: verify every bridge node has a nearby
+            // endpoint in the replacement edges. If not, preserve originals.
+            if !local_drop.is_empty() && !local_add.is_empty() {
+                if !replacement_serves_nodes(&node_coords, &local_drop, &local_add, &network.geometries, params.consolidation_tolerance) {
+                    log::info!("    [singletons] replacement disconnects a node — preserving edges");
+                    local_drop.clear();
+                    local_add.clear();
+                }
             }
 
             if let Some(pb) = progress { pb.inc(1); }
@@ -2367,6 +2400,113 @@ fn remove_dangles(connections: &[LineString<f64>], artifact: &Polygon<f64>, eps:
         .collect()
 }
 
+/// Check that the proposed replacement (drop + add) preserves connectivity
+/// among the covered edges' connection points (node_coords).
+///
+/// Builds a mini Union-Find from:
+/// 1. to_add edges (skeleton replacement)
+/// 2. surviving network edges at node_coords
+/// Then checks that all node_coords end up in the same connected component.
+/// If any node_coord becomes isolated, returns false.
+fn replacement_serves_nodes(
+    node_coords: &[[f64; 2]],
+    to_drop: &[usize],
+    to_add: &[LineString<f64>],
+    network_geoms: &[LineString<f64>],
+    tolerance: f64,
+) -> bool {
+    if node_coords.len() <= 1 {
+        return true;
+    }
+
+    let tol2 = tolerance * tolerance;
+    let drop_set: HashSet<usize> = to_drop.iter().copied().collect();
+
+    // Map each node_coord to a canonical index (0..n)
+    let n = node_coords.len();
+
+    // Simple UF over indices 0..n (one per node_coord)
+    let mut uf_parent: Vec<usize> = (0..n).collect();
+
+    fn uf_find(parent: &mut [usize], x: usize) -> usize {
+        let mut root = x;
+        while parent[root] != root {
+            root = parent[root];
+        }
+        let mut curr = x;
+        while curr != root {
+            let next = parent[curr];
+            parent[curr] = root;
+            curr = next;
+        }
+        root
+    }
+
+    fn uf_union(parent: &mut [usize], a: usize, b: usize) {
+        let ra = uf_find(parent, a);
+        let rb = uf_find(parent, b);
+        if ra != rb {
+            parent[rb] = ra;
+        }
+    }
+
+    // Helper: find node_coord index nearest to a point (within tolerance)
+    let find_nc = |x: f64, y: f64| -> Option<usize> {
+        let mut best_idx = None;
+        let mut best_d2 = tol2;
+        for (i, nc) in node_coords.iter().enumerate() {
+            let d2 = (nc[0] - x).powi(2) + (nc[1] - y).powi(2);
+            if d2 < best_d2 {
+                best_d2 = d2;
+                best_idx = Some(i);
+            }
+        }
+        best_idx
+    };
+
+    // Union node_coords connected by to_add edges
+    for geom in to_add {
+        let gc = &geom.0;
+        if gc.len() < 2 {
+            continue;
+        }
+        let start_nc = find_nc(gc[0].x, gc[0].y);
+        let end_nc = find_nc(gc[gc.len() - 1].x, gc[gc.len() - 1].y);
+        if let (Some(a), Some(b)) = (start_nc, end_nc) {
+            if a != b {
+                uf_union(&mut uf_parent, a, b);
+            }
+        }
+    }
+
+    // Union node_coords connected by surviving (non-dropped) network edges
+    for (i, geom) in network_geoms.iter().enumerate() {
+        if drop_set.contains(&i) {
+            continue;
+        }
+        let gc = &geom.0;
+        if gc.len() < 2 {
+            continue;
+        }
+        let start_nc = find_nc(gc[0].x, gc[0].y);
+        let end_nc = find_nc(gc[gc.len() - 1].x, gc[gc.len() - 1].y);
+        if let (Some(a), Some(b)) = (start_nc, end_nc) {
+            if a != b {
+                uf_union(&mut uf_parent, a, b);
+            }
+        }
+    }
+
+    // Check: all node_coords should be in the same component
+    let root = uf_find(&mut uf_parent, 0);
+    for i in 1..n {
+        if uf_find(&mut uf_parent, i) != root {
+            return false;
+        }
+    }
+    true
+}
+
 /// Convert node coordinate arrays to small LineString geometries for snap targets.
 ///
 /// Creates 2-point degenerate LineStrings (point-like) that the voronoi_skeleton
@@ -2381,6 +2521,274 @@ fn node_coords_to_lines(coords: &[[f64; 2]]) -> Vec<LineString<f64>> {
             ])
         })
         .collect()
+}
+
+/// Spatial connectivity repair: find pre-loop edges whose endpoints are now in
+/// different output components and add bridging edges to restore connectivity.
+///
+/// Uses an R-tree to match pre-loop edge endpoints to the nearest output
+/// Snap edge endpoints within `tol` meters of each other to the same coordinate.
+///
+/// Groups nearby endpoints using an R-tree, picks the most common coordinate
+/// as the canonical one, and updates all other endpoints in the group to match.
+/// Returns the number of endpoints that were snapped.
+fn snap_endpoints(network: &mut StreetNetwork, tol: f64) -> usize {
+    if network.geometries.is_empty() {
+        return 0;
+    }
+
+    // Collect all endpoints: (coord, edge_idx, is_end)
+    let mut ep_data: Vec<(Coord<f64>, usize, bool)> = Vec::new();
+    for (idx, geom) in network.geometries.iter().enumerate() {
+        let coords = &geom.0;
+        if coords.len() < 2 {
+            continue;
+        }
+        ep_data.push((coords[0], idx, false));
+        ep_data.push((coords[coords.len() - 1], idx, true));
+    }
+
+    if ep_data.is_empty() {
+        return 0;
+    }
+
+    // Build R-tree
+    let points: Vec<rstar::primitives::GeomWithData<[f64; 2], usize>> = ep_data
+        .iter()
+        .enumerate()
+        .map(|(i, (c, _, _))| rstar::primitives::GeomWithData::new([c.x, c.y], i))
+        .collect();
+    let rtree = rstar::RTree::bulk_load(points);
+
+    let tol2 = tol * tol;
+    let n_ep = ep_data.len();
+    let mut visited = vec![false; n_ep];
+    let mut snapped = 0usize;
+
+    // For each unvisited endpoint, find all endpoints within tol and snap to
+    // the coordinate that appears most frequently (mode).
+    for i in 0..n_ep {
+        if visited[i] {
+            continue;
+        }
+
+        let coord = &ep_data[i].0;
+        use rstar::AABB;
+        let envelope = AABB::from_corners(
+            [coord.x - tol, coord.y - tol],
+            [coord.x + tol, coord.y + tol],
+        );
+
+        // Collect all nearby endpoints
+        let mut group: Vec<usize> = Vec::new();
+        for nearby in rtree.locate_in_envelope(&envelope) {
+            let j = nearby.data;
+            if visited[j] {
+                continue;
+            }
+            let d2 = (coord.x - ep_data[j].0.x).powi(2) + (coord.y - ep_data[j].0.y).powi(2);
+            if d2 < tol2 {
+                group.push(j);
+            }
+        }
+
+        if group.len() <= 1 {
+            visited[i] = true;
+            continue;
+        }
+
+        // Find the most common coordinate in the group
+        let mut coord_counts: HashMap<(i64, i64), (Coord<f64>, usize)> = HashMap::new();
+        for &j in &group {
+            let c = &ep_data[j].0;
+            // Use sub-mm grid to identify "same" coords (floating point exact matches)
+            let key = ((c.x * 1000.0).round() as i64, (c.y * 1000.0).round() as i64);
+            coord_counts.entry(key).or_insert((*c, 0)).1 += 1;
+        }
+        let canonical = coord_counts.values().max_by_key(|(_, count)| *count).unwrap().0;
+
+        // Snap all group members to canonical
+        for &j in &group {
+            visited[j] = true;
+            let (ref c, edge_idx, is_end) = ep_data[j];
+            if (c.x - canonical.x).abs() < 1e-12 && (c.y - canonical.y).abs() < 1e-12 {
+                continue; // already at canonical
+            }
+            let geom = &mut network.geometries[edge_idx];
+            let n = geom.0.len();
+            if is_end {
+                geom.0[n - 1] = canonical;
+            } else {
+                geom.0[0] = canonical;
+            }
+            snapped += 1;
+        }
+    }
+
+    snapped
+}
+
+/// endpoints, then checks component membership via Union-Find. Bridging edges
+/// use actual output endpoint coordinates to ensure they connect properly.
+fn repair_connectivity_spatial(
+    network: &mut StreetNetwork,
+    pre_loop_geometries: &[LineString<f64>],
+    match_tol: f64,
+) -> usize {
+    if network.geometries.is_empty() || pre_loop_geometries.is_empty() {
+        return 0;
+    }
+
+    // Collect all output edge endpoints with their edge index
+    let mut endpoints: Vec<(Coord<f64>, usize)> = Vec::new(); // (coord, edge_idx)
+    for (idx, geom) in network.geometries.iter().enumerate() {
+        let coords = &geom.0;
+        if coords.len() < 2 {
+            continue;
+        }
+        endpoints.push((coords[0], idx));
+        endpoints.push((coords[coords.len() - 1], idx));
+    }
+
+    if endpoints.is_empty() {
+        return 0;
+    }
+
+    // Build R-tree from endpoints for nearest-neighbor lookup
+    let points: Vec<rstar::primitives::GeomWithData<[f64; 2], usize>> = endpoints
+        .iter()
+        .enumerate()
+        .map(|(i, (c, _))| rstar::primitives::GeomWithData::new([c.x, c.y], i))
+        .collect();
+    let rtree = rstar::RTree::bulk_load(points);
+
+    // Build Union-Find over endpoint indices. Two endpoints of the same edge
+    // are in the same component. Two endpoints at the same location (within
+    // snap tolerance) are also in the same component.
+    let n_ep = endpoints.len();
+    let mut uf_parent: Vec<usize> = (0..n_ep).collect();
+
+    fn uf_find(parent: &mut [usize], x: usize) -> usize {
+        let mut root = x;
+        while parent[root] != root {
+            root = parent[root];
+        }
+        let mut curr = x;
+        while curr != root {
+            let next = parent[curr];
+            parent[curr] = root;
+            curr = next;
+        }
+        root
+    }
+
+    fn uf_union(parent: &mut [usize], a: usize, b: usize) {
+        let ra = uf_find(parent, a);
+        let rb = uf_find(parent, b);
+        if ra != rb {
+            parent[rb] = ra;
+        }
+    }
+
+    // Union endpoints of the same edge
+    // Endpoints are stored in pairs: (edge start, edge end) for each edge.
+    // But they're stored as (coord, edge_idx). Let me build a map edge_idx → endpoint indices.
+    let mut edge_to_eps: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (ep_idx, &(_, edge_idx)) in endpoints.iter().enumerate() {
+        edge_to_eps.entry(edge_idx).or_default().push(ep_idx);
+    }
+    for eps_vec in edge_to_eps.values() {
+        if eps_vec.len() >= 2 {
+            for i in 1..eps_vec.len() {
+                uf_union(&mut uf_parent, eps_vec[0], eps_vec[i]);
+            }
+        }
+    }
+
+    // Union endpoints that are at the same location (within a tight tolerance)
+    let snap_tol = 0.5; // 0.5m — same-node snapping
+    let snap_tol2 = snap_tol * snap_tol;
+    for (ep_idx, (coord, _)) in endpoints.iter().enumerate() {
+        use rstar::AABB;
+        let envelope = AABB::from_corners(
+            [coord.x - snap_tol, coord.y - snap_tol],
+            [coord.x + snap_tol, coord.y + snap_tol],
+        );
+        for nearby in rtree.locate_in_envelope(&envelope) {
+            let other_idx = nearby.data;
+            if other_idx == ep_idx {
+                continue;
+            }
+            let other = &endpoints[other_idx].0;
+            let d2 = (coord.x - other.x).powi(2) + (coord.y - other.y).powi(2);
+            if d2 < snap_tol2 {
+                uf_union(&mut uf_parent, ep_idx, other_idx);
+            }
+        }
+    }
+
+    // For each pre-loop edge, find nearest output endpoint to each end,
+    // check if they're in different components, and add bridging edge if so.
+    let match_tol2 = match_tol * match_tol;
+    let mut bridges: Vec<(Coord<f64>, Coord<f64>)> = Vec::new();
+
+    for geom in pre_loop_geometries {
+        let coords = &geom.0;
+        if coords.len() < 2 {
+            continue;
+        }
+        let start = coords[0];
+        let end = coords[coords.len() - 1];
+
+        // Find nearest output endpoint to start
+        let start_nn = rtree.nearest_neighbor(&[start.x, start.y]);
+        let end_nn = rtree.nearest_neighbor(&[end.x, end.y]);
+
+        let (start_ep_idx, start_coord) = match start_nn {
+            Some(nn) => {
+                let idx = nn.data;
+                let d2 = (start.x - endpoints[idx].0.x).powi(2) + (start.y - endpoints[idx].0.y).powi(2);
+                if d2 > match_tol2 {
+                    continue;
+                }
+                (idx, endpoints[idx].0)
+            }
+            None => continue,
+        };
+        let (end_ep_idx, end_coord) = match end_nn {
+            Some(nn) => {
+                let idx = nn.data;
+                let d2 = (end.x - endpoints[idx].0.x).powi(2) + (end.y - endpoints[idx].0.y).powi(2);
+                if d2 > match_tol2 {
+                    continue;
+                }
+                (idx, endpoints[idx].0)
+            }
+            None => continue,
+        };
+
+        // Check if they're in different components
+        let rs = uf_find(&mut uf_parent, start_ep_idx);
+        let re = uf_find(&mut uf_parent, end_ep_idx);
+        if rs != re {
+            bridges.push((start_coord, end_coord));
+            uf_union(&mut uf_parent, start_ep_idx, end_ep_idx);
+        }
+    }
+
+    let n = bridges.len();
+    if n == 0 {
+        return 0;
+    }
+
+    log::info!("  [connectivity_repair] adding {} bridging edges", n);
+    for (start, end) in &bridges {
+        network.geometries.push(LineString::new(vec![*start, *end]));
+        network.statuses.push(EdgeStatus::Changed);
+        network.parent_ids.push(vec![]);
+    }
+
+    n
 }
 
 /// Fast containment check: avoids full `Relate` when all vertices + midpoints are inside.
