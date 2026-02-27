@@ -75,6 +75,151 @@ fn finish_progress_bar(pb: &ProgressBar, label: &str) {
     eprintln!("  {label} {len}/{len} ({elapsed:.1?})");
 }
 
+/// Summary returned by [`diagnostics()`] — cheap pre-flight metrics.
+#[derive(Debug, Clone)]
+pub struct NeatifyDiagnostics {
+    pub n_input_edges: usize,
+    pub n_edges_after_topology: usize,
+    pub n_artifacts: usize,
+    pub fai_threshold: f64,
+    pub n_singles: usize,
+    pub n_pairs: usize,
+    pub n_cluster_artifacts: usize,
+    pub n_cluster_groups: usize,
+    pub max_cluster_size: usize,
+    pub fix_topology_secs: f64,
+    pub consolidate_secs: f64,
+    pub artifact_detection_secs: f64,
+}
+
+/// Diagnostic / dry-run mode: runs the cheap setup phases (fix_topology,
+/// consolidate_nodes, artifact detection, classification) and returns
+/// complexity metrics without performing any simplification.
+///
+/// Covers ~1-5% of total `neatify` runtime but reveals all the signals
+/// needed to estimate cost.
+pub fn diagnostics(
+    network: &mut StreetNetwork,
+    params: &NeatifyParams,
+    exclusion_mask: Option<&[Polygon<f64>]>,
+) -> Result<NeatifyDiagnostics, NeatifyError> {
+    let n_input_edges = network.geometries.len();
+
+    // Step 1: Fix topology
+    let t_step = Instant::now();
+    let (fixed_geoms, fixed_statuses, fixed_parents) =
+        nodes::fix_topology(
+            std::mem::take(&mut network.geometries),
+            std::mem::take(&mut network.statuses),
+            std::mem::take(&mut network.parent_ids),
+            params.eps,
+        );
+    network.geometries = fixed_geoms;
+    network.statuses = fixed_statuses;
+    network.parent_ids = fixed_parents;
+    let fix_topology_secs = t_step.elapsed().as_secs_f64();
+    let n_edges_after_topology = network.geometries.len();
+
+    // Step 2: Consolidate nodes
+    let t_step = Instant::now();
+    let edge_tree = crate::spatial::build_rtree(&network.geometries);
+    let (consol_geoms, consol_statuses, consol_parents) = nodes::consolidate_nodes_with_tree(
+        &network.geometries,
+        &network.statuses,
+        &network.parent_ids,
+        params.max_segment_length * 2.1,
+        false,
+        Some(&edge_tree),
+    );
+    network.geometries = consol_geoms;
+    network.statuses = consol_statuses;
+    network.parent_ids = consol_parents;
+    let consolidate_secs = t_step.elapsed().as_secs_f64();
+
+    // Step 3: Detect artifacts
+    let t_step = Instant::now();
+    let artifacts = artifacts::get_artifacts(
+        &network.geometries,
+        params.artifact_threshold,
+        params.artifact_threshold_fallback,
+        exclusion_mask,
+        params.area_threshold_blocks,
+        params.isoareal_threshold_blocks,
+        params.area_threshold_circles,
+        params.isoareal_threshold_circles_enclosed,
+        params.isoperimetric_threshold_circles_touching,
+    );
+    let artifact_detection_secs = t_step.elapsed().as_secs_f64();
+
+    let (artifact_geoms, _artifact_fais, threshold) = match artifacts {
+        Some(a) => a,
+        None => {
+            return Ok(NeatifyDiagnostics {
+                n_input_edges,
+                n_edges_after_topology,
+                n_artifacts: 0,
+                fai_threshold: 0.0,
+                n_singles: 0,
+                n_pairs: 0,
+                n_cluster_artifacts: 0,
+                n_cluster_groups: 0,
+                max_cluster_size: 0,
+                fix_topology_secs,
+                consolidate_secs,
+                artifact_detection_secs,
+            });
+        }
+    };
+
+    // Step 4: Classify artifacts (same logic as neatify_loop)
+    let adjacency = artifacts::build_contiguity_graph(&artifact_geoms, true);
+    let comp_labels = artifacts::component_labels_from_adjacency(&adjacency);
+
+    let mut comp_sizes: HashMap<usize, usize> = HashMap::new();
+    for &label in &comp_labels {
+        *comp_sizes.entry(label).or_default() += 1;
+    }
+
+    let mut n_singles = 0usize;
+    let mut n_pairs = 0usize;
+    let mut n_cluster_artifacts = 0usize;
+    let mut cluster_labels: HashSet<usize> = HashSet::new();
+
+    for &label in &comp_labels {
+        match comp_sizes.get(&label) {
+            Some(&1) => n_singles += 1,
+            Some(&2) => n_pairs += 1,
+            Some(_) => {
+                n_cluster_artifacts += 1;
+                cluster_labels.insert(label);
+            }
+            None => {}
+        }
+    }
+
+    let n_cluster_groups = cluster_labels.len();
+    let max_cluster_size = cluster_labels
+        .iter()
+        .map(|l| comp_sizes[l])
+        .max()
+        .unwrap_or(0);
+
+    Ok(NeatifyDiagnostics {
+        n_input_edges,
+        n_edges_after_topology,
+        n_artifacts: artifact_geoms.len(),
+        fai_threshold: threshold,
+        n_singles,
+        n_pairs,
+        n_cluster_artifacts,
+        n_cluster_groups,
+        max_cluster_size,
+        fix_topology_secs,
+        consolidate_secs,
+        artifact_detection_secs,
+    })
+}
+
 /// Top-level simplification entry point.
 ///
 /// Follows the Adaptive Continuity-Preserving Simplification algorithm:
@@ -106,7 +251,7 @@ pub fn neatify(
     network.geometries = fixed_geoms;
     network.statuses = fixed_statuses;
     network.parent_ids = fixed_parents;
-    log::info!("[neatify] fix_topology: {:.3}s ({} edges)", t_step.elapsed().as_secs_f64(), network.geometries.len());
+    eprintln!("  fix_topology: {:.1}s ({} edges)", t_step.elapsed().as_secs_f64(), network.geometries.len());
 
     // Step 2: Consolidate nodes (pass pre-built tree to avoid redundant build)
     let t_step = Instant::now();
@@ -122,7 +267,7 @@ pub fn neatify(
     network.geometries = consol_geoms;
     network.statuses = consol_statuses;
     network.parent_ids = consol_parents;
-    log::info!("[neatify] consolidate_nodes: {:.3}s ({} edges)", t_step.elapsed().as_secs_f64(), network.geometries.len());
+    eprintln!("  consolidate_nodes: {:.1}s ({} edges)", t_step.elapsed().as_secs_f64(), network.geometries.len());
 
     // Step 3: Detect artifacts (with iterative expansion)
     let t_step = Instant::now();
@@ -145,7 +290,7 @@ pub fn neatify(
             return Ok(());
         }
     };
-    log::info!("[neatify] get_artifacts: {:.3}s ({} artifacts)", t_step.elapsed().as_secs_f64(), artifact_geoms.len());
+    eprintln!("  get_artifacts: {:.1}s ({} artifacts)", t_step.elapsed().as_secs_f64(), artifact_geoms.len());
 
     if artifact_geoms.is_empty() {
         log::warn!("No artifacts found. Returning after topology fixes.");
@@ -155,9 +300,10 @@ pub fn neatify(
     // Step 4: Iterative simplification loops
     let mut current_artifacts = artifact_geoms;
     for loop_idx in 0..params.n_loops {
+        eprintln!("  loop {} ...", loop_idx + 1);
         let t_loop = Instant::now();
         neatify_loop(network, &current_artifacts, params)?;
-        log::info!("[neatify] loop {}: neatify_loop {:.3}s", loop_idx, t_loop.elapsed().as_secs_f64());
+        eprintln!("  loop {} simplify: {:.1}s", loop_idx + 1, t_loop.elapsed().as_secs_f64());
 
         // Free artifact polygons before post-loop cleanup.
         // They'll be re-detected if another loop is needed.
@@ -177,7 +323,7 @@ pub fn neatify(
         network.statuses = induced_statuses;
         network.parent_ids = induced_parents;
         dedup_network(network);
-        log::info!("[neatify] loop {}: post-cleanup {:.3}s ({} edges)", loop_idx, t_step.elapsed().as_secs_f64(), network.geometries.len());
+        eprintln!("  loop {} post-cleanup: {:.1}s ({} edges)", loop_idx + 1, t_step.elapsed().as_secs_f64(), network.geometries.len());
 
         // Re-detect artifacts for subsequent loops (or create empty placeholder for last loop)
         if loop_idx < params.n_loops - 1 {
@@ -193,7 +339,7 @@ pub fn neatify(
                 params.isoareal_threshold_circles_enclosed,
                 params.isoperimetric_threshold_circles_touching,
             );
-            log::info!("[neatify] loop {}: re-detect artifacts {:.3}s", loop_idx, t_step.elapsed().as_secs_f64());
+            eprintln!("  loop {} re-detect artifacts: {:.1}s", loop_idx + 1, t_step.elapsed().as_secs_f64());
             match re_artifacts {
                 Some((new_geoms, _new_fais, _new_threshold)) => {
                     current_artifacts = new_geoms;
@@ -767,69 +913,86 @@ fn neatify_clusters(
         .collect();
 
     let t_clusters = Instant::now();
+    log::info!("    [clusters] {} eligible clusters (>= 3 artifacts), rayon threads={}", eligible_clusters.len(), rayon::current_num_threads());
 
     use rayon::prelude::*;
-    let results: Vec<(Vec<usize>, Vec<LineString<f64>>)> = eligible_clusters
+
+    // Phase 1: Cascaded union for all clusters in parallel.
+    // Each cluster produces a simplified MultiPolygon and artifact count for progress.
+    let merged_clusters: Vec<(MultiPolygon<f64>, u64)> = eligible_clusters
         .par_iter()
         .map(|cluster| {
-            let mut local_drop: Vec<usize> = Vec::new();
-            let mut local_add: Vec<LineString<f64>> = Vec::new();
-
             let n_artifacts = cluster.len() as u64;
             let cluster_polys: Vec<Polygon<f64>> = cluster.iter().map(|&i| artifact_geoms[i].clone()).collect();
             let merged = cascaded_union(&cluster_polys);
-
             if merged.0.is_empty() {
                 if let Some(pb) = progress { pb.inc(n_artifacts); }
-                return (local_drop, local_add);
+                return (MultiPolygon::new(vec![]), 0);
             }
-
-            let merged: MultiPolygon<f64> = MultiPolygon::new(
+            let simplified = MultiPolygon::new(
                 merged.0.into_iter()
                     .map(|p| p.simplify(params.eps / 10.0))
                     .collect()
             );
-
-            for merged_poly in &merged.0 {
-                let covered = find_covered_edges_with_tree(&network.geometries, &tree, merged_poly, params.eps);
-                if covered.is_empty() {
-                    continue;
-                }
-
-                let boundary_edges =
-                    find_boundary_edges_with_tree(&network.geometries, &tree, merged_poly, params.eps);
-                if boundary_edges.is_empty() {
-                    local_drop.extend(&covered);
-                    continue;
-                }
-
-                let boundary_geoms: Vec<LineString<f64>> = boundary_edges
-                    .iter()
-                    .map(|&i| network.geometries[i].clone())
-                    .collect();
-                let (skel, _) = geometry::voronoi_skeleton(
-                    &boundary_geoms,
-                    Some(merged_poly),
-                    None,
-                    params.max_segment_length,
-                    None,
-                    None,
-                    params.clip_limit,
-                    Some(params.consolidation_tolerance),
-                );
-                local_drop.extend(&covered);
-                local_add.extend(skel);
-            }
-
-            if let Some(pb) = progress { pb.inc(n_artifacts); }
-            (local_drop, local_add)
+            (simplified, n_artifacts)
         })
         .collect();
 
-    for (drops, adds) in results {
+    // Phase 2: Flatten all merged polygons into a single work list, then
+    // process them in one flat par_iter. This avoids nested parallelism and
+    // distributes work evenly — critical when one cluster produces hundreds
+    // of merged polygons (e.g., 559 from a 9646-artifact cluster).
+    let work_items: Vec<&Polygon<f64>> = merged_clusters
+        .iter()
+        .flat_map(|(mp, _)| mp.0.iter())
+        .collect();
+
+    log::info!("    [clusters] {} merged polygons to process", work_items.len());
+
+    let poly_results: Vec<(Vec<usize>, Vec<LineString<f64>>)> = work_items
+        .par_iter()
+        .filter_map(|merged_poly| {
+            let covered = find_covered_edges_with_tree(&network.geometries, &tree, merged_poly, params.eps);
+            if covered.is_empty() {
+                return None;
+            }
+
+            let boundary_edges =
+                find_boundary_edges_with_tree(&network.geometries, &tree, merged_poly, params.eps);
+            if boundary_edges.is_empty() {
+                return Some((covered, Vec::new()));
+            }
+
+            let boundary_geoms: Vec<LineString<f64>> = boundary_edges
+                .iter()
+                .map(|&i| network.geometries[i].clone())
+                .collect();
+            let (skel, _) = geometry::voronoi_skeleton(
+                &boundary_geoms,
+                Some(merged_poly),
+                None,
+                params.max_segment_length,
+                None,
+                None,
+                params.clip_limit,
+                Some(params.consolidation_tolerance),
+            );
+            Some((covered, skel))
+        })
+        .collect();
+
+    for (drops, adds) in poly_results {
         to_drop.extend(drops);
         to_add.extend(adds);
     }
+
+    // Update progress for clusters that produced merged polygons
+    for (_, n_artifacts) in &merged_clusters {
+        if *n_artifacts > 0 {
+            if let Some(pb) = progress { pb.inc(*n_artifacts); }
+        }
+    }
+
     log::info!("    [clusters] {} clusters processed in {:.3}s", eligible_clusters.len(), t_clusters.elapsed().as_secs_f64());
 
     apply_changes(network, &to_drop, &to_add, params);
