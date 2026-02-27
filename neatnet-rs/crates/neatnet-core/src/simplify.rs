@@ -880,6 +880,69 @@ fn cascaded_union(polygons: &[Polygon<f64>]) -> MultiPolygon<f64> {
     level.into_iter().next().unwrap_or(MultiPolygon(vec![]))
 }
 
+/// Split a large cluster of artifact indices into spatially partitioned sub-clusters.
+///
+/// Uses a grid partition based on polygon centroids. Each grid cell's artifacts
+/// become a sub-cluster that can be processed independently. This breaks up
+/// monster clusters (e.g., 9,646 artifacts) into manageable parallel work items.
+fn split_cluster_spatially(
+    cluster: &[usize],
+    artifact_geoms: &[Polygon<f64>],
+    target_size: usize,
+) -> Vec<Vec<usize>> {
+    use geo::Centroid;
+
+    // Compute centroids and bounding box
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+
+    let centroids: Vec<Option<Point<f64>>> = cluster
+        .iter()
+        .map(|&idx| {
+            let c = artifact_geoms[idx].centroid();
+            if let Some(pt) = &c {
+                min_x = min_x.min(pt.x());
+                min_y = min_y.min(pt.y());
+                max_x = max_x.max(pt.x());
+                max_y = max_y.max(pt.y());
+            }
+            c
+        })
+        .collect();
+
+    let range_x = max_x - min_x;
+    let range_y = max_y - min_y;
+    if range_x <= 0.0 || range_y <= 0.0 {
+        return vec![cluster.to_vec()];
+    }
+
+    // Grid dimensions: aim for target_size artifacts per cell
+    let n_cells = (cluster.len() as f64 / target_size as f64).sqrt().ceil() as usize;
+    let n_cells = n_cells.max(2);
+    let cell_w = range_x / n_cells as f64;
+    let cell_h = range_y / n_cells as f64;
+
+    // Assign each artifact to a grid cell
+    let mut cells: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+    for (i, &art_idx) in cluster.iter().enumerate() {
+        let (cx, cy) = match &centroids[i] {
+            Some(pt) => (pt.x(), pt.y()),
+            None => continue,
+        };
+        let col = ((cx - min_x) / cell_w).floor() as usize;
+        let row = ((cy - min_y) / cell_h).floor() as usize;
+        let col = col.min(n_cells - 1);
+        let row = row.min(n_cells - 1);
+        cells.entry((row, col)).or_default().push(art_idx);
+    }
+
+    // Collect non-empty cells as sub-clusters, filtering out tiny ones
+    // (sub-clusters < 3 artifacts can't form valid clusters)
+    cells.into_values().filter(|c| c.len() >= 3).collect()
+}
+
 /// Simplify clusters of face artifacts.
 fn neatify_clusters(
     network: &mut StreetNetwork,
@@ -904,22 +967,38 @@ fn neatify_clusters(
     // Build R-tree once for all cluster lookups
     let tree = crate::spatial::build_rtree(&network.geometries);
 
-    let eligible_clusters: Vec<&Vec<usize>> = sorted_cluster_labels
-        .iter()
-        .filter_map(|label| {
-            let cluster = &cluster_groups[label];
-            if cluster.len() >= 3 { Some(cluster) } else { None }
-        })
-        .collect();
+    // Split large clusters spatially before processing. This breaks monster
+    // clusters (thousands of artifacts) into manageable sub-clusters that
+    // produce smaller merged polygons, avoiding the O(n²+) voronoi_skeleton
+    // bottleneck on single huge polygons.
+    const CLUSTER_SPLIT_THRESHOLD: usize = 500;
+    const CLUSTER_SPLIT_TARGET_SIZE: usize = 100;
+
+    let mut work_clusters: Vec<Vec<usize>> = Vec::new();
+
+    for label in &sorted_cluster_labels {
+        let cluster = &cluster_groups[label];
+        if cluster.len() < 3 { continue; }
+
+        if cluster.len() > CLUSTER_SPLIT_THRESHOLD {
+            let sub_clusters = split_cluster_spatially(cluster, artifact_geoms, CLUSTER_SPLIT_TARGET_SIZE);
+            log::info!("    [clusters] split cluster of {} artifacts into {} sub-clusters",
+                       cluster.len(), sub_clusters.len());
+            work_clusters.extend(sub_clusters);
+        } else {
+            work_clusters.push(cluster.clone());
+        }
+    }
 
     let t_clusters = Instant::now();
-    log::info!("    [clusters] {} eligible clusters (>= 3 artifacts), rayon threads={}", eligible_clusters.len(), rayon::current_num_threads());
+    log::info!("    [clusters] {} work clusters (after splitting), rayon threads={}",
+               work_clusters.len(), rayon::current_num_threads());
 
     use rayon::prelude::*;
 
-    // Phase 1: Cascaded union for all clusters in parallel.
+    // Phase 1: Cascaded union for all (sub-)clusters in parallel.
     // Each cluster produces a simplified MultiPolygon and artifact count for progress.
-    let merged_clusters: Vec<(MultiPolygon<f64>, u64)> = eligible_clusters
+    let merged_clusters: Vec<(MultiPolygon<f64>, u64)> = work_clusters
         .par_iter()
         .map(|cluster| {
             let n_artifacts = cluster.len() as u64;
@@ -993,7 +1072,7 @@ fn neatify_clusters(
         }
     }
 
-    log::info!("    [clusters] {} clusters processed in {:.3}s", eligible_clusters.len(), t_clusters.elapsed().as_secs_f64());
+    log::info!("    [clusters] {} work clusters processed in {:.3}s", work_clusters.len(), t_clusters.elapsed().as_secs_f64());
 
     apply_changes(network, &to_drop, &to_add, params);
     Ok(())
